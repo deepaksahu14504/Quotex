@@ -1,0 +1,52 @@
+[
+  {
+    "id": "ac2a17b30009",
+    "signal_id": "0c7d0b6c215d",
+    "created_at": 1787450705.779623,
+    "asset": "USCrude_otc",
+    "direction": "put",
+    "amount": 1.4,
+    "duration": 60,
+    "is_demo": true,
+    "status": "loss",
+    "open_price": 47.357,
+    "close_price": null,
+    "profit": -1.4,
+    "payout": 89.0,
+    "confidence": 100,
+    "raw_confidence": 91,
+    "regime": "trend",
+    "strategies": [
+      "ema_ribbon",
+      "supertrend",
+      "adx_di"
+    ],
+    "timeframe": "15m",
+    "broker_order_id": "e0dfcb30-72b5-4160-9d8b-5ad64823f165",
+    "closed_at": 1787450767.214073,
+    "decision_id": "e2c8461e57ed",
+    "note": null,
+    "features": {
+      "weekday": 6,
+      "hour": 2,
+      "session": "asian",
+      "is_otc": true,
+      "adx_at_entry": 27.534376748552265,
+      "atr_pct_at_entry": 0.43878877617584905,
+      "rsi_at_entry": 38.31377092547946,
+      "volatility_percentile": null,
+      "volume_ratio_at_entry": 0.0,
+      "confluence_count": 3,
+      "quality_score": 91.0,
+      "adaptive_state": {
+        "dead_market_adx_threshold": 14.0,
+        "dead_market_atr_pct_floor": 0.03,
+        "dead_market_rsi_high": 85.0,
+        "dead_market_rsi_low": 15.0,
+        "risk_stake_multiplier": 1.0,
+        "risk_cooldown_multiplier": 1.0
+      },
+      "execution_latency_ms": null
+    }
+  }
+]

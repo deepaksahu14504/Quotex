@@ -1,0 +1,49 @@
+# Local/staging convenience stack: PostgreSQL + the backend.
+#
+# This does NOT replace your existing deployment method (DEPLOYMENT.md) --
+# it exists so `docker compose up` gives you a working Postgres instance
+# without installing it on the host, matching the DATABASE_URL default in
+# backend/.env.example. The backend still runs as ONE process (see
+# DEPLOYMENT.md's "run exactly ONE backend process" note) — that constraint
+# is about the in-memory Orchestrator/websocket-hub registry, not the
+# database, and moving to Postgres does not lift it.
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: qat_app
+      POSTGRES_PASSWORD: qat_app
+      POSTGRES_DB: qat
+    volumes:
+      - qat_pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qat_app -d qat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://qat_app:qat_app@db:5432/qat
+      HOST: 0.0.0.0
+      PORT: "8090"
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./backend/data:/app/data   # non-DB state only now (e.g. per-user JSON persistence under engine/services)
+
+volumes:
+  qat_pgdata:

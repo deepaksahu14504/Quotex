@@ -1,0 +1,19 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+numpy==2.2.1
+pandas==2.2.3
+httpx==0.28.1
+python-dotenv==1.0.1
+websockets==13.1
+cryptography==44.0.0
+
+# --- Database (PostgreSQL) ---
+SQLAlchemy==2.0.36
+psycopg[binary]==3.2.3      # PostgreSQL driver (psycopg 3), used for both the
+                             # sync engine (SQLAlchemy) and Alembic migrations
+alembic==1.14.0
+
+# --- Optional: required only for REAL Quotex connectivity (vendor/API-Quotex) ---
+# Install separately with:  pip install -r requirements-quotex.txt

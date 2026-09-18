@@ -1,0 +1,100 @@
+{
+  "trend_pullback||mixed": {
+    "mean": 0.5,
+    "cumulative_sum": 2.4102958152958154,
+    "sample_count": 12,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "ema_ribbon||mixed": {
+    "mean": 0.5,
+    "cumulative_sum": 2.774868464868465,
+    "sample_count": 14,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "supertrend||mixed": {
+    "mean": 0.5,
+    "cumulative_sum": 2.774868464868465,
+    "sample_count": 14,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "trend_pullback||trend": {
+    "mean": 0.5454545454545454,
+    "cumulative_sum": 1.4603391053391057,
+    "sample_count": 11,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "ema_ribbon||trend": {
+    "mean": 0.5,
+    "cumulative_sum": 2.3691053391053387,
+    "sample_count": 12,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "supertrend||trend": {
+    "mean": 0.3846153846153846,
+    "cumulative_sum": 1.2370657120657116,
+    "sample_count": 13,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "adx_di||trend": {
+    "mean": 0.75,
+    "cumulative_sum": 1.0683333333333334,
+    "sample_count": 4,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "macd_cross||mixed": {
+    "mean": 0.5,
+    "cumulative_sum": 0.495,
+    "sample_count": 2,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "momentum_breakout||mixed": {
+    "mean": 0.5,
+    "cumulative_sum": 1.1566666666666667,
+    "sample_count": 4,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "stoch_rsi||mixed": {
+    "mean": 0.3333333333333333,
+    "cumulative_sum": 0.6616666666666667,
+    "sample_count": 3,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "momentum_breakout||trend": {
+    "mean": 0.5,
+    "cumulative_sum": 0.495,
+    "sample_count": 2,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "psar||mixed": {
+    "mean": 1.0,
+    "cumulative_sum": 0.0,
+    "sample_count": 1,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "stoch_rsi||trend": {
+    "mean": 0.0,
+    "cumulative_sum": 0.0,
+    "sample_count": 4,
+    "last_alert_at": null,
+    "total_alerts": 0
+  },
+  "psar||trend": {
+    "mean": 1.0,
+    "cumulative_sum": 0.0,
+    "sample_count": 2,
+    "last_alert_at": null,
+    "total_alerts": 0
+  }
+}

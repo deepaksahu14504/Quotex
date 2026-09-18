@@ -1,0 +1,7 @@
+# Extra dependencies needed by vendor/pyquotex beyond what's already in
+# requirements.txt (httpx, websockets, certifi are already covered there).
+# Install with: pip install -r requirements-quotex.txt
+beautifulsoup4>=4.12.3
+fake-useragent>=2.2.0
+pyfiglet>=1.0.2
+rich>=13.7.0

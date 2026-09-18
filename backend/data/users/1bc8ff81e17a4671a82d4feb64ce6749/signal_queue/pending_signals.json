@@ -1,0 +1,26 @@
+{
+  "1080c44bc770": {
+    "signal_id": "1080c44bc770",
+    "asset": "AUDJPY_otc",
+    "direction": "call",
+    "confidence": 70.0,
+    "price": 113.824,
+    "timeframe": "15m",
+    "created_at": 1787451062.861029,
+    "stored_at": 1787451166.7433686,
+    "attempts": 0,
+    "last_attempt": 0.0
+  },
+  "151e3fc5911e": {
+    "signal_id": "151e3fc5911e",
+    "asset": "AUDJPY_otc",
+    "direction": "call",
+    "confidence": 67.0,
+    "price": 113.88,
+    "timeframe": "15m",
+    "created_at": 1787451149.707479,
+    "stored_at": 1787451213.3016233,
+    "attempts": 0,
+    "last_attempt": 0.0
+  }
+}

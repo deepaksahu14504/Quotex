@@ -1,0 +1,188 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #05070f;
+  --color-bg-2: #080b16;
+  --color-panel: rgba(255, 255, 255, 0.045);
+  --color-panel-2: rgba(255, 255, 255, 0.07);
+  --color-hair: rgba(255, 255, 255, 0.09);
+  --color-ink: #eaf0ff;
+  --color-ink-dim: #9aa6c4;
+  --color-ink-faint: #5d6788;
+  --color-up: #2bdca0;
+  --color-down: #ff5a76;
+  --color-accent: #4ad6ff;
+  --color-accent-2: #8a7bff;
+  --color-gold: #ffce5c;
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+@font-face {
+  font-family: "Inter";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("https://fonts.gstatic.com/s/inter/v13/UcCO3FwrK3iLTeHuS_fvQtMwCp50KnMw2boKoduKmMEVuLyfAZ9hiA.woff2") format("woff2");
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+  box-sizing: border-box;
+}
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+  background: var(--color-bg);
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  letter-spacing: -0.01em;
+}
+
+.nums { font-variant-numeric: tabular-nums; font-feature-settings: "tnum" 1, "cv01" 1; }
+.tight { letter-spacing: -0.025em; }
+
+/* ---- Background: deep gradient + aurora ------------------------------- */
+.bg-scene {
+  position: fixed;
+  inset: 0;
+  z-index: -3;
+  background:
+    radial-gradient(50vw 50vw at 12% 8%, rgba(138, 123, 255, 0.20), transparent 55%),
+    radial-gradient(48vw 48vw at 88% 12%, rgba(74, 214, 255, 0.16), transparent 55%),
+    radial-gradient(70vw 60vw at 50% 108%, rgba(43, 220, 160, 0.10), transparent 60%),
+    linear-gradient(180deg, #05070f 0%, #04060d 100%);
+}
+.bg-scene::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 80% 60% at 50% 0%, black, transparent 75%);
+  opacity: 0.5;
+}
+
+/* ---- Glass surfaces ---------------------------------------------------- */
+.glass {
+  position: relative;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.025));
+  backdrop-filter: blur(22px) saturate(150%);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  border: 1px solid var(--color-hair);
+  border-radius: 24px;
+  box-shadow:
+    0 1px 0 0 rgba(255, 255, 255, 0.06) inset,
+    0 24px 60px -28px rgba(0, 0, 0, 0.85),
+    0 8px 24px -16px rgba(0, 0, 0, 0.6);
+}
+/* gradient hairline sheen on top edge */
+.glass::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 35%);
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+  opacity: 0.7;
+}
+.glass-2 { background: linear-gradient(180deg, rgba(255, 255, 255, 0.09), rgba(255, 255, 255, 0.04)); }
+
+.tile {
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 16px;
+}
+
+.input {
+  width: 100%;
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.05);
+  padding: 0.5rem 0.75rem;
+  font-size: 13px;
+  color: white;
+  outline: none;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.1);
+  transition: box-shadow 0.15s ease;
+}
+.input:focus {
+  box-shadow: 0 0 0 1.5px var(--color-accent);
+}
+
+.text-up { color: var(--color-up); }
+.text-down { color: var(--color-down); }
+.text-dim { color: var(--color-ink-dim); }
+.text-faint { color: var(--color-ink-faint); }
+
+.gradient-text {
+  background: linear-gradient(120deg, var(--color-accent), var(--color-accent-2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.label {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-ink-faint);
+  font-weight: 600;
+}
+
+/* ---- Scrollbar -------------------------------------------------------- */
+::-webkit-scrollbar { width: 7px; height: 7px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.1); border-radius: 99px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.18); }
+::-webkit-scrollbar-track { background: transparent; }
+
+select option { background: #0a0f1e; }
+
+/* ---- Animations ------------------------------------------------------- */
+@keyframes drift {
+  0% { transform: translate3d(-3%, -2%, 0) scale(1.05); }
+  100% { transform: translate3d(4%, 3%, 0) scale(1.12); }
+}
+@keyframes pulse-dot {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(43, 220, 160, 0.5); }
+  50% { box-shadow: 0 0 0 6px rgba(43, 220, 160, 0); }
+}
+.pulse-dot { animation: pulse-dot 2.2s ease-out infinite; }
+@keyframes sheen {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(220%); }
+}
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  animation: sheen 1.6s infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+.safe-bottom { padding-bottom: max(0.75rem, env(safe-area-inset-bottom)); }
+.safe-top { padding-top: max(0.5rem, env(safe-area-inset-top)); }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }

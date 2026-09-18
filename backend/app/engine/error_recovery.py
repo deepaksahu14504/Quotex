@@ -1,0 +1,254 @@
+"""Error recovery and circuit breaker patterns for production resilience.
+
+Handles:
+- API failures with exponential backoff
+- Timeout management
+- Circuit breaker pattern (fail-fast)
+- Graceful degradation
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Awaitable, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+
+class ErrorType(Enum):
+    """Classification of error types for recovery strategies."""
+    API_TIMEOUT = "api_timeout"           # Temporary - retry with backoff
+    RATE_LIMITED = "rate_limited"         # Temporary - backoff + cooldown
+    INVALID_DATA = "invalid_data"         # Permanent - reject signal
+    CONNECTION_ERROR = "connection_error" # Temporary - backoff
+    UNKNOWN_ERROR = "unknown_error"       # Unknown - backoff
+
+
+def _classify_error(exc: Exception) -> ErrorType:
+    """Best-effort classification of a caught exception for retry decisions.
+
+    Deliberately conservative: only returns INVALID_DATA (the one
+    non-retriable class) when the exception type strongly suggests malformed
+    or unparseable data rather than a transient dependency failure. Anything
+    not confidently recognized falls through to UNKNOWN_ERROR, which stays in
+    RetryConfig.retriable_errors by default -- so this can only ever make
+    retry behavior *more* targeted (fail fast on a real permanent error),
+    never silently stop retrying something that used to be retried.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return ErrorType.API_TIMEOUT
+    if isinstance(exc, (ConnectionError, OSError)):
+        return ErrorType.CONNECTION_ERROR
+    msg = str(exc).lower()
+    if "rate limit" in msg or "too many requests" in msg or "429" in msg:
+        return ErrorType.RATE_LIMITED
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        return ErrorType.INVALID_DATA
+    return ErrorType.UNKNOWN_ERROR
+
+
+class CircuitBreakerState(Enum):
+    CLOSED = "closed"     # Normal operation
+    OPEN = "open"         # Failing - reject all calls
+    HALF_OPEN = "half_open"  # Testing recovery
+
+
+@dataclass
+class CircuitBreaker:
+    """Circuit breaker: fails fast when dependency is down."""
+    name: str
+    failure_threshold: int = 5      # Failures before opening
+    success_threshold: int = 2      # Successes to close from half-open
+    timeout_seconds: float = 60.0   # Time before trying half-open
+    
+    state: CircuitBreakerState = CircuitBreakerState.CLOSED
+    failure_count: int = 0
+    success_count: int = 0
+    last_failure_time: float = 0.0
+    probe_in_flight: bool = False  # HALF_OPEN: only one probe request allowed at a time
+    
+    def record_success(self) -> None:
+        self.failure_count = 0
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.probe_in_flight = False
+            self.success_count += 1
+            if self.success_count >= self.success_threshold:
+                self.state = CircuitBreakerState.CLOSED
+                self.success_count = 0
+                logger.info(f"[v0] Circuit breaker '{self.name}' CLOSED (recovered)")
+    
+    def record_failure(self) -> None:
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        
+        if self.state == CircuitBreakerState.CLOSED:
+            if self.failure_count >= self.failure_threshold:
+                self.state = CircuitBreakerState.OPEN
+                logger.error(f"[v0] Circuit breaker '{self.name}' OPEN ({self.failure_count} failures)")
+        elif self.state == CircuitBreakerState.HALF_OPEN:
+            self.probe_in_flight = False
+            self.state = CircuitBreakerState.OPEN
+            self.success_count = 0
+    
+    def allow_request(self) -> bool:
+        """Check if request should be allowed."""
+        if self.state == CircuitBreakerState.CLOSED:
+            return True
+        elif self.state == CircuitBreakerState.OPEN:
+            # Check if timeout elapsed, try half-open
+            if time.time() - self.last_failure_time >= self.timeout_seconds:
+                self.state = CircuitBreakerState.HALF_OPEN
+                self.success_count = 0
+                self.probe_in_flight = True
+                logger.info(f"[v0] Circuit breaker '{self.name}' HALF_OPEN (testing)")
+                return True
+            return False
+        else:  # HALF_OPEN — allow exactly one probe in flight at a time, so a
+            # burst of concurrent callers (e.g. orchestrator scanning several
+            # assets via asyncio.gather) can't all flood a dependency that
+            # just started to recover.
+            if not self.probe_in_flight:
+                self.probe_in_flight = True
+                return True
+            return False
+
+
+@dataclass
+class ExponentialBackoff:
+    """Exponential backoff strategy for retries."""
+    base_delay: float = 0.1  # Start with 100ms
+    max_delay: float = 30.0  # Cap at 30 seconds
+    multiplier: float = 2.0  # Double each time
+    jitter_enabled: bool = True
+    
+    attempt: int = field(default=0, init=False)
+    
+    def next_delay(self) -> float:
+        """Calculate next delay with optional jitter."""
+        delay = min(self.base_delay * (self.multiplier ** self.attempt), self.max_delay)
+        if self.jitter_enabled:
+            import random
+            delay *= random.uniform(0.5, 1.5)
+        self.attempt += 1
+        return delay
+    
+    def reset(self) -> None:
+        self.attempt = 0
+
+
+@dataclass
+class RetryConfig:
+    """Configuration for retry behavior."""
+    max_retries: int = 3
+    backoff: ExponentialBackoff = field(default_factory=ExponentialBackoff)
+    circuit_breaker: Optional[CircuitBreaker] = None
+    
+    retriable_errors: set = field(default_factory=lambda: {
+        ErrorType.API_TIMEOUT,
+        ErrorType.RATE_LIMITED,
+        ErrorType.CONNECTION_ERROR,
+        ErrorType.UNKNOWN_ERROR,  # "Unknown - backoff" per ErrorType's own
+        # docstring -- must stay retriable so anything not confidently
+        # classified below preserves today's always-retry behavior. Only
+        # INVALID_DATA is excluded, since that's the one case we can
+        # actually recognize with confidence (see _classify_error).
+    })
+
+
+class ErrorRecovery:
+    """Comprehensive error recovery and resilience management."""
+    
+    def __init__(self):
+        self.circuit_breakers: dict[str, CircuitBreaker] = {}
+        self.retry_configs: dict[str, RetryConfig] = {}
+    
+    def create_circuit_breaker(self, name: str, **kwargs) -> CircuitBreaker:
+        """Create a circuit breaker for a service."""
+        cb = CircuitBreaker(name, **kwargs)
+        self.circuit_breakers[name] = cb
+        return cb
+    
+    async def execute_with_retry(
+        self,
+        func: Callable[..., Awaitable[Any]],
+        service_name: str,
+        *args,
+        timeout: Optional[float] = None,
+        **kwargs
+    ) -> Any:
+        """Execute function with retry + circuit breaker.
+
+        Raises last exception if all retries fail.
+
+        `timeout` (seconds, optional) bounds EACH attempt. This machinery
+        is entirely exception-driven -- retries, the circuit breaker and
+        the error classifier all key off something being raised -- so a
+        call that HANGS rather than fails was previously invisible to all
+        of it: `await func(*args)` simply never returned and this method
+        never returned either (proven in backend/prove_root_cause.py,
+        LINK 3). Bounding the attempt turns a hang into a TimeoutError,
+        which _classify_error already maps to a retriable error type, so
+        the existing retry/backoff/breaker behaviour applies to it with
+        no other change. Left as None the behaviour is bit-for-bit what
+        it was, so no existing caller changes until it opts in.
+        """
+        config = self.retry_configs.get(service_name, RetryConfig())
+        cb = config.circuit_breaker
+        
+        # Check circuit breaker
+        if cb and not cb.allow_request():
+            raise RuntimeError(f"Circuit breaker '{service_name}' is OPEN")
+        
+        last_error = None
+        for attempt in range(config.max_retries + 1):
+            try:
+                if timeout is None:
+                    result = await func(*args, **kwargs)
+                else:
+                    result = await asyncio.wait_for(func(*args, **kwargs), timeout=timeout)
+                if cb:
+                    cb.record_success()
+                return result
+            except asyncio.CancelledError:
+                # Never let a genuine cancellation (shutdown, an outer
+                # wait_for firing) be swallowed by the retry loop below
+                # and retried as if it were a transient failure.
+                raise
+            except Exception as e:
+                last_error = e
+                if cb:
+                    cb.record_failure()
+
+                error_type = _classify_error(e)
+                if error_type not in config.retriable_errors:
+                    logger.error(
+                        f"[v0] {service_name} failed with non-retriable error "
+                        f"({error_type.value}), not retrying: {e}"
+                    )
+                    raise
+
+                if attempt < config.max_retries:
+                    delay = config.backoff.next_delay()
+                    logger.warning(
+                        f"[v0] {service_name} attempt {attempt + 1}/{config.max_retries + 1} failed: {e} "
+                        f"(retry in {delay:.1f}s)"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        f"[v0] {service_name} failed after {config.max_retries + 1} attempts: {e}"
+                    )
+        
+        raise last_error
+
+
+# Global instance
+_error_recovery = ErrorRecovery()
+
+
+def get_recovery() -> ErrorRecovery:
+    """Get global error recovery instance."""
+    return _error_recovery

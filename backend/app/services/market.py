@@ -1570,6 +1570,17 @@ class PyQuotexProvider(MarketProvider):
                     stored = 0
                     for c in hist or []:
                         if isinstance(c, dict) and "time" in c:
+                            # Binary: Quotex history has no real volume, but has tick count.
+                            # Use ticks as volume proxy so live indicators have *some* activity measure.
+                            # For binary trading we now treat volume as neutral (indicators return 1.0
+                            # when no real volume), but keeping tick count preserves info for Binance path
+                            # and for future analysis without breaking binary logic.
+                            if "volume" not in c or not c.get("volume"):
+                                if "ticks" in c:
+                                    try:
+                                        c["volume"] = float(c["ticks"])
+                                    except Exception:
+                                        c["volume"] = 0.0
                             cache[float(c["time"])] = c
                             stored += 1
                     log_event(logger, logging.INFO, "HISTORY_STORED",
@@ -1601,6 +1612,12 @@ class PyQuotexProvider(MarketProvider):
                 )
                 for c in raw or []:
                     if isinstance(c, dict) and "time" in c:
+                        if "volume" not in c or not c.get("volume"):
+                            if "ticks" in c:
+                                try:
+                                    c["volume"] = float(c["ticks"])
+                                except Exception:
+                                    c["volume"] = 0.0
                         cache[float(c["time"])] = c
             except asyncio.CancelledError:
                 raise
@@ -1633,11 +1650,20 @@ class PyQuotexProvider(MarketProvider):
                 bucket = float(int(ts // period * period))
                 row = cache.get(bucket)
                 if row is None:
-                    cache[bucket] = {"time": bucket, "open": price, "high": price, "low": price, "close": price, "volume": 0}
+                    # Binary: open=new tick, volume=1 (tick count proxy)
+                    cache[bucket] = {"time": bucket, "open": price, "high": price, "low": price, "close": price, "volume": 1.0, "ticks": 1}
                 else:
                     row["close"] = price
                     row["high"] = max(row["high"], price)
                     row["low"] = min(row["low"], price)
+                    # Increment tick-count volume proxy — gives *some* activity measure for live candle
+                    # For binary we treat volume as neutral (indicators return 1.0 when no variance),
+                    # but counting ticks is still useful and matches how Binance volume works.
+                    try:
+                        row["volume"] = float(row.get("volume", 0) or 0) + 1.0
+                        row["ticks"] = int(row.get("ticks", 0) or 0) + 1
+                    except Exception:
+                        row["volume"] = 1.0
                 folded.append(t)
             self._advance_tick_cursor(asset, period, folded)
 
@@ -1649,8 +1675,14 @@ class PyQuotexProvider(MarketProvider):
         out: List[Candle] = []
         for c in rows:
             try:
+                vol = c.get("volume", 0) or 0
+                if not vol and "ticks" in c:
+                    try:
+                        vol = float(c["ticks"])
+                    except Exception:
+                        vol = 0
                 out.append(Candle(timestamp=float(c["time"]), open=float(c["open"]), high=float(c["high"]),
-                                  low=float(c["low"]), close=float(c["close"]), volume=float(c.get("volume", 0) or 0)))
+                                  low=float(c["low"]), close=float(c["close"]), volume=float(vol)))
             except Exception:
                 continue
         return out
@@ -1681,8 +1713,14 @@ class PyQuotexProvider(MarketProvider):
         out: List[Candle] = []
         for c in rows[-bars:]:
             try:
+                vol = c.get("volume", 0) or 0
+                if not vol and "ticks" in c:
+                    try:
+                        vol = float(c["ticks"])
+                    except Exception:
+                        vol = 0
                 out.append(Candle(timestamp=float(c["time"]), open=float(c["open"]), high=float(c["high"]),
-                                  low=float(c["low"]), close=float(c["close"]), volume=float(c.get("volume", 0) or 0)))
+                                  low=float(c["low"]), close=float(c["close"]), volume=float(vol)))
             except Exception:
                 continue
         return out

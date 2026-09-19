@@ -387,6 +387,10 @@ export const STRATEGY_LABELS: Record<string, string> = {
   macd_cross: "MACD Cross",
   stoch_rsi: "Stochastic RSI",
   rsi_divergence: "RSI Divergence",
+  vol_norm_reversion: "Vol-Norm Reversion",
+  confluence_breakout: "Confluence Breakout",
+  session_swing: "Session Swing",
+  multi_confluence: "Multi-Factor Confluence",
   "(none)": "Manual / Other",
 };
 

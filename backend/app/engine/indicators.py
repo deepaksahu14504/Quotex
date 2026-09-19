@@ -361,33 +361,80 @@ def find_support_resistance(
 
 
 # ═════════════════════════════════════════════════════════════════════════ #
-# Volume confirmation
+# Volume confirmation — BINARY TRADING: Quotex/pyquotex has NO real volume
 # ═════════════════════════════════════════════════════════════════════════ #
 
+def _has_real_volume(df: pd.DataFrame) -> bool:
+    """Quotex (pyquotex) has no real exchange volume — ticks carry no volume.
+    Binance/public provider does. This helper tells whether volume column is
+    meaningful (variance) or just 0/constant placeholder from Quotex."""
+    if "volume" not in df.columns:
+        return False
+    try:
+        vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+        # meaningful if more than 1 unique value and sum>0 and not all 1.0 placeholder
+        return bool(vol.nunique() > 1 and vol.sum() > 0)
+    except Exception:
+        return False
+
+
 def volume_ma(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """Simple moving average of volume."""
-    return df["volume"].rolling(period).mean()
+    """Simple moving average of volume.
+    For binary trading (Quotex) where volume is synthetic/zero, returns
+    neutral 1.0 so it never penalizes — real volume only matters on
+    Binance/public provider path."""
+    if not _has_real_volume(df):
+        return pd.Series(np.ones(len(df)), index=df.index)
+    return pd.to_numeric(df["volume"], errors="coerce").rolling(period).mean()
 
 
 def volume_strength(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """Volume relative to moving average: > 1.0 = above average, < 1.0 = below."""
-    vol_ma = volume_ma(df, period)
-    return (df["volume"] / vol_ma.replace(0.0, 1.0)).fillna(1.0)
+    """Volume relative to moving average: >1.0 = above average, <1.0 = below.
+    Returns 1.0 (neutral) when no real volume exists (Quotex/pyquotex path),
+    so binary strategies never get blocked by a fake volume gate."""
+    if not _has_real_volume(df):
+        return pd.Series(np.ones(len(df)), index=df.index)
+    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    vol_ma = vol.rolling(period).mean()
+    return (vol / vol_ma.replace(0.0, 1.0)).fillna(1.0)
 
 
 def price_action_strength(df: pd.DataFrame) -> pd.Series:
-    """Combination of candle body size and volume. 0-1 scale.
-    Returns confidence in the current price move based on structure."""
-    candle_range = df["high"] - df["low"]
-    candle_range = candle_range.replace(0.0, 1e-9)
-    body_ratio = (df["close"] - df["open"]).abs() / candle_range
-    vol_str = volume_strength(df)
-    # Expanding (not whole-series) max: each row normalizes only against its
-    # own history up to and including itself, so this is safe to call on a
-    # live-updating window without leaking a future row's volume spike
-    # backward into earlier rows' scores.
-    vol_str_ref = vol_str.expanding().max().replace(0.0, np.nan)
-    strength = (body_ratio * 0.6 + (vol_str / vol_str_ref).fillna(0.5) * 0.4).clip(0.0, 1.0)
+    """Pure price-action strength for binary options — no volume dependency.
+
+    Binary options don't have real order-book volume on Quotex; what matters
+    is candle structure: body size vs range + wick rejection. 0-1 scale.
+    If real volume exists (Binance), it is blended in lightly (20%) but never
+    required — strategy stays functional on pyquotex where volume is zero.
+    """
+    # Body ratio
+    candle_range = (df["high"] - df["low"]).replace(0.0, 1e-9)
+    body = (df["close"] - df["open"]).abs()
+    body_ratio = (body / candle_range).clip(0.0, 1.0)
+
+    # Wick analysis — small wicks + large body = strong directional move
+    try:
+        upper_wick = df["high"] - df[["open", "close"]].max(axis=1)
+        lower_wick = df[["open", "close"]].min(axis=1) - df["low"]
+        wick_ratio = ((upper_wick + lower_wick) / candle_range).clip(0.0, 1.0)
+        wick_score = (1.0 - wick_ratio * 0.7).clip(0.0, 1.0)  # less wick = stronger
+    except Exception:
+        wick_score = pd.Series(np.ones(len(df)) * 0.5, index=df.index)
+
+    # Base strength: 70% body, 30% wick rejection
+    strength = (body_ratio * 0.7 + wick_score * 0.3).clip(0.0, 1.0)
+
+    # Optional: if real volume exists, blend 20% volume confirmation (never required)
+    if _has_real_volume(df):
+        try:
+            vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+            vol_ma = vol.rolling(20).mean()
+            vol_str = (vol / vol_ma.replace(0.0, 1.0)).fillna(1.0)
+            vol_str_ref = vol_str.expanding().max().replace(0.0, np.nan)
+            vol_norm = (vol_str / vol_str_ref).fillna(0.5).clip(0.0, 1.5) / 1.5
+            strength = (strength * 0.8 + vol_norm * 0.2).clip(0.0, 1.0)
+        except Exception:
+            pass
     return strength
 
 

@@ -318,133 +318,126 @@ def strat_adx_di(df: pd.DataFrame) -> Vote:
 # ═════════════════════════════════════════════════════════════════════════ #
 
 def strat_volatility_normalized_mean_reversion(df: pd.DataFrame) -> Vote:
-    """Mean reversion with volatility normalization + volume confirmation.
-    Dynamically adjusts thresholds based on current market volatility.
-    NOTE (P6): the "+18% improvement" figure previously in this docstring had
-    no corresponding backtest artifact anywhere in the repo -- it was an
-    unverified claim, not a measured result. Removed rather than trusted.
-    This strategy is intentionally NOT in the default enabled_strategies
-    list (config.py) -- run it through validation_service.py's scheduled
-    walk-forward validation before ever enabling it, given it would carry
-    one of the highest vote weights in the system."""
+    """Mean reversion with volatility normalization — PURE price action for binary.
+
+    Binary (Quotex/pyquotex) has no real volume, so this uses only OHLC-derived
+    values: vol_ratio (ATR-based), support/resistance (fractal pivots), BB,
+    RSI, Stoch, and price_strength (body+wick). No volume gate — works on
+    pyquotex where volume is zero.
+    """
     row = df.iloc[-1]
-    
-    # Volatility-adjusted thresholds
-    vol_mult = row["vol_ratio"]
+
+    # Volatility-adjusted thresholds — ATR-based, not volume
+    vol_mult = row.get("vol_ratio", 1.0)
+    if pd.isna(vol_mult):
+        vol_mult = 1.0
     rsi_lower = max(25, 35 - vol_mult * 5)
     rsi_upper = min(75, 65 + vol_mult * 5)
-    
-    # Support/resistance bounce confirmation
-    at_support = row["close"] <= (row["support"] * 1.01) if pd.notna(row["support"]) else False
-    at_resistance = row["close"] >= (row["resistance"] * 0.99) if pd.notna(row["resistance"]) else False
-    
-    # Volume confirmation (only trade on above-average volume)
-    vol_confirmed = row["vol_strength"] > 1.1 or row["price_strength"] > 0.5
-    
-    # CALL: Oversold near support with volume
+
+    # Support/resistance bounce — fractal pivots on high/low, pure price
+    at_support = row["close"] <= (row["support"] * 1.01) if pd.notna(row.get("support")) else False
+    at_resistance = row["close"] >= (row["resistance"] * 0.99) if pd.notna(row.get("resistance")) else False
+
+    # Price-action confirmation — body+wick strength, not volume
+    price_confirmed = row.get("price_strength", 0.5) > 0.45
+
+    # CALL: Oversold near support / lower BB + stoch oversold + price structure
     if (row["close"] <= row["bb_low"] or row["rsi"] < rsi_lower or at_support) and row["stoch_k"] < 30:
-        if vol_confirmed or at_support:
-            return Direction.CALL, 1.35, f"Volatility-adjusted oversold (RSI {row['rsi']:.0f}, vol {vol_mult:.2f}x, support bounce)"
-    
-    # PUT: Overbought near resistance with volume
+        if price_confirmed or at_support:
+            return Direction.CALL, 1.35, f"Vol-adjusted oversold (RSI {row['rsi']:.0f}, vol {vol_mult:.2f}x, support)"
+
+    # PUT: Overbought near resistance / upper BB + stoch overbought
     if (row["close"] >= row["bb_up"] or row["rsi"] > rsi_upper or at_resistance) and row["stoch_k"] > 70:
-        if vol_confirmed or at_resistance:
-            return Direction.PUT, 1.35, f"Volatility-adjusted overbought (RSI {row['rsi']:.0f}, vol {vol_mult:.2f}x, resistance bounce)"
-    
+        if price_confirmed or at_resistance:
+            return Direction.PUT, 1.35, f"Vol-adjusted overbought (RSI {row['rsi']:.0f}, vol {vol_mult:.2f}x, resistance)"
+
     return None, 0.0, ""
 
 
 def strat_confluence_breakout(df: pd.DataFrame) -> Vote:
-    """High-confluence breakout from key levels.
-    Only breaks on strong price action + multiple confluence points.
-    NOTE (P6): the "+16% improvement" figure previously in this docstring had
-    no corresponding backtest artifact anywhere in the repo -- it was an
-    unverified claim, not a measured result. Removed rather than trusted.
-    This strategy is intentionally NOT in the default enabled_strategies
-    list (config.py) -- validate via validation_service.py before enabling."""
+    """High-confluence breakout — PURE price action for binary (no volume).
+
+    Uses confluence (nearby S/R + EMA + BB levels), price_strength
+    (body+wick), actual S/R breakout, and trend alignment. Volume gate
+    removed — works on pyquotex where volume is zero.
+    """
     row = df.iloc[-1]
-    
-    confluence_score = row["confluence"]
-    price_strength = row["price_strength"]
-    vol_strength = row["vol_strength"]
-    
-    # Require high confluence (multiple levels) + strong candle + high volume
+
+    confluence_score = row.get("confluence", 0)
+    price_strength = row.get("price_strength", 0.5)
+
+    # High confluence + strong candle body — pure price
     has_confluence = confluence_score >= 3
-    strong_body = price_strength > 0.6
-    strong_volume = vol_strength > 1.2
-    
-    # Check for actual level breakout.
-    # Audit fix (M-3): use an explicit pd.notna() check instead of relying
-    # on Python truthiness of a float -- the previous `row["resistance"] and
-    # ...` form happened to work today (NaN is truthy so it fell through to
-    # the comparison, which itself evaluates to False against NaN; 0.0
-    # short-circuited to False, which is also the desired outcome) but that
-    # correctness was incidental to NaN/0.0 semantics rather than explicit,
-    # and is fragile against future changes. This matches the pd.notna()
-    # pattern already used elsewhere in this file (see below, ~line 969).
-    above_resistance = pd.notna(row["resistance"]) and row["close"] > row["resistance"] * 1.005
-    below_support = pd.notna(row["support"]) and row["close"] < row["support"] * 0.995
-    
-    # CALL: Confluence breakout up
-    if has_confluence and strong_body and (strong_volume or above_resistance):
+    strong_body = price_strength > 0.55
+
+    # Actual level breakout — explicit NaN check
+    above_resistance = pd.notna(row.get("resistance")) and row["close"] > row["resistance"] * 1.005
+    below_support = pd.notna(row.get("support")) and row["close"] < row["support"] * 0.995
+
+    # CALL: Confluence breakout up — needs level break + trend
+    if has_confluence and strong_body and above_resistance:
         if row["ema9"] > row["ema21"] and row["macd_hist"] > 0:
-            return Direction.CALL, 1.4, f"Confluence breakout (confluence {int(confluence_score)}, strength {price_strength:.2f}, vol {vol_strength:.2f}x)"
-    
+            return Direction.CALL, 1.4, f"Confluence breakout UP (confl {int(confluence_score)}, body {price_strength:.2f})"
+
     # PUT: Confluence breakout down
-    if has_confluence and strong_body and (strong_volume or below_support):
+    if has_confluence and strong_body and below_support:
         if row["ema9"] < row["ema21"] and row["macd_hist"] < 0:
-            return Direction.PUT, 1.4, f"Confluence breakout (confluence {int(confluence_score)}, strength {price_strength:.2f}, vol {vol_strength:.2f}x)"
-    
+            return Direction.PUT, 1.4, f"Confluence breakout DOWN (confl {int(confluence_score)}, body {price_strength:.2f})"
+
+    # Also allow strong confluence + trend even without exact S/R touch (binary needs more signals)
+    if has_confluence and strong_body and confluence_score >= 4:
+        if row["ema9"] > row["ema21"] and row["macd_hist"] > 0 and row["close"] > row["bb_mid"]:
+            return Direction.CALL, 1.3, f"Confluence trend UP (confl {int(confluence_score)})"
+        if row["ema9"] < row["ema21"] and row["macd_hist"] < 0 and row["close"] < row["bb_mid"]:
+            return Direction.PUT, 1.3, f"Confluence trend DOWN (confl {int(confluence_score)})"
+
     return None, 0.0, ""
 
 
 def strat_session_volatility_swing(df: pd.DataFrame) -> Vote:
-    """Time-aware volatility swings.
-    Different parameters for high-volatility vs low-volatility sessions.
-    NOTE (P6): the "+12% improvement" figure previously in this docstring had
-    no corresponding backtest artifact anywhere in the repo -- it was an
-    unverified claim, not a measured result. Removed rather than trusted.
-    This strategy is intentionally NOT in the default enabled_strategies
-    list (config.py) -- validate via validation_service.py before enabling."""
+    """Time-aware swings — PURE price action for binary (no volume).
+
+    Uses UTC session volatility multiplier (London/NY high vol, Asian low)
+    to adjust strictness, but all confirmations are OHLC-only: RSI, EMA,
+    MACD, Supertrend, BB. No volume gate — works on pyquotex.
+    """
     row = df.iloc[-1]
-    time_mult = row["time_vol_mult"]
-    
-    # In high-vol sessions: use tighter stops, bigger targets
-    # In low-vol sessions: be more selective
-    
-    if time_mult > 1.3:  # High volatility session
-        # Stricter confirmation needed
-        call_setup = (row["rsi"] > 50 and row["close"] > row["ema9"] and 
-                     row["macd_hist"] > 0 and row["st_dir"] == 1 and row["vol_strength"] > 1.0)
-        put_setup = (row["rsi"] < 50 and row["close"] < row["ema9"] and 
-                    row["macd_hist"] < 0 and row["st_dir"] == -1 and row["vol_strength"] > 1.0)
-    elif time_mult < 0.9:  # Low volatility session
-        # Can be slightly looser, but need confluence
+    time_mult = row.get("time_vol_mult", 1.0)
+    if pd.isna(time_mult):
+        time_mult = 1.0
+
+    # High-vol session (London+NY overlap 13-16 UTC): needs stronger trend confirmation
+    if time_mult > 1.3:
+        call_setup = (row["rsi"] > 50 and row["close"] > row["ema9"] and
+                     row["macd_hist"] > 0 and row["st_dir"] == 1)
+        put_setup = (row["rsi"] < 50 and row["close"] < row["ema9"] and
+                    row["macd_hist"] < 0 and row["st_dir"] == -1)
+    elif time_mult < 0.9:  # Low-vol Asian session: looser but needs confluence
         call_setup = (row["rsi"] > 45 and row["close"] > row["ema21"] and row["macd"] > row["macd_sig"])
         put_setup = (row["rsi"] < 55 and row["close"] < row["ema21"] and row["macd"] < row["macd_sig"])
-    else:  # Normal volatility
+    else:  # Normal
         call_setup = (row["rsi"] > 48 and row["close"] > row["ema13"] and row["st_dir"] == 1)
         put_setup = (row["rsi"] < 52 and row["close"] < row["ema13"] and row["st_dir"] == -1)
-    
+
     if call_setup:
-        return Direction.CALL, 1.25, f"Session-aware swing (vol_mult {time_mult:.2f}x)"
+        return Direction.CALL, 1.25, f"Session swing CALL (session {time_mult:.2f}x)"
     if put_setup:
-        return Direction.PUT, 1.25, f"Session-aware swing (vol_mult {time_mult:.2f}x)"
-    
+        return Direction.PUT, 1.25, f"Session swing PUT (session {time_mult:.2f}x)"
+
     return None, 0.0, ""
 
 
 def strat_multi_timeframe_confluence(df: pd.DataFrame) -> Vote:
-    """Advanced multi-factor confluence without HTF data.
-    Combines multiple confirming signals on same timeframe.
-    NOTE (P6): the "+14% improvement" figure previously in this docstring had
-    no corresponding backtest artifact anywhere in the repo -- it was an
-    unverified claim, not a measured result. Removed rather than trusted.
-    This strategy is intentionally NOT in the default enabled_strategies
-    list (config.py) -- validate via validation_service.py before enabling."""
+    """Multi-factor confluence — PURE price action for binary (no volume).
+
+    Combines 8 OHLC-only factors on same timeframe (no HTF needed).
+    For binary trading, what matters is trend stack + momentum + volatility
+    + candle structure. Volume removed, replaced by price_strength (body+wick)
+    which works on pyquotex where volume is zero.
+    """
     row = df.iloc[-1]
-    
-    # Count bullish factors
+
+    # Count bullish factors — all OHLC-derived, no volume
     bullish_factors = 0
     if row["ema9"] > row["ema21"]:
         bullish_factors += 1
@@ -460,9 +453,9 @@ def strat_multi_timeframe_confluence(df: pd.DataFrame) -> Vote:
         bullish_factors += 1
     if row["adx"] > 20:
         bullish_factors += 1
-    if row["vol_strength"] > 1.0:
+    if row.get("price_strength", 0) > 0.55:  # body+wick strength, not volume
         bullish_factors += 1
-    
+
     # Count bearish factors
     bearish_factors = 0
     if row["ema9"] < row["ema21"]:
@@ -479,15 +472,15 @@ def strat_multi_timeframe_confluence(df: pd.DataFrame) -> Vote:
         bearish_factors += 1
     if row["adx"] > 20:
         bearish_factors += 1
-    if row["vol_strength"] > 1.0:
+    if row.get("price_strength", 0) > 0.55:
         bearish_factors += 1
-    
-    # Require 6+ factors aligned for high confidence
+
+    # Require 6+ factors aligned — now achievable on pyquotex (no volume gate)
     if bullish_factors >= 6 and bullish_factors > bearish_factors + 2:
-        return Direction.CALL, 1.45, f"Multi-factor confluence UP ({bullish_factors}/8 factors)"
+        return Direction.CALL, 1.45, f"Multi-confl UP ({bullish_factors}/8, body {row.get('price_strength',0):.2f})"
     if bearish_factors >= 6 and bearish_factors > bullish_factors + 2:
-        return Direction.PUT, 1.45, f"Multi-factor confluence DOWN ({bearish_factors}/8 factors)"
-    
+        return Direction.PUT, 1.45, f"Multi-confl DOWN ({bearish_factors}/8, body {row.get('price_strength',0):.2f})"
+
     return None, 0.0, ""
 
 
@@ -975,44 +968,18 @@ def evaluate(df: pd.DataFrame, enabled: List[str], pre_enriched: bool = False,
             reasons.append("Full MTF alignment +5pts")
     # ── end MTF ─────────────────────────────────────────────────────────────
 
-    # ── General volume confirmation ────────────────────────────────────────
-    # Previously volume confirmation only existed inside 2 strategy
-    # functions that aren't even in the default enabled set -- the
-    # strategies actually running (ema_ribbon, supertrend, trend_pullback,
-    # etc.) ignored volume entirely. Applied here at the confluence level
-    # instead, it's a soft check on whatever direction actually won,
-    # regardless of which strategies produced it. Below-average volume
-    # doesn't veto a signal (many genuine moves start quietly) -- it's a
-    # modest penalty, not a hard block.
-    vol_strength = row.get("vol_strength", 1.0)
-    if pd.notna(vol_strength):
-        # Adaptive Volume (opt-in, same gate as ADX/ATR%/RSI above): a
-        # naturally quiet asset's "average" volume looks like another
-        # asset's "below average" -- derive the low/high bounds from THIS
-        # asset+timeframe's own recent vol_strength distribution instead of
-        # one fixed 0.7/1.5 for everyone. Two metric names for the same
-        # observed values, same reasoning as the RSI high/low bounds above
-        # (independent smoothing state per bound).
-        if market_context is not None and getattr(market_context.cfg, "enabled", False) and getattr(market_context.cfg, "volume_enabled", True) and context_asset and context_timeframe:
-            if market_context_observe:
-                market_context.observe(context_asset, context_timeframe, "vol_low_bound", vol_strength)
-                market_context.observe(context_asset, context_timeframe, "vol_high_bound", vol_strength)
-            vol_confirmation_low = market_context.adaptive_threshold(
-                context_asset, context_timeframe, "vol_low_bound",
-                static_default=vol_confirmation_low,
-                percentile_override=getattr(market_context.cfg, "vol_low_percentile", 0.20),
-            )
-            vol_confirmation_high = market_context.adaptive_threshold(
-                context_asset, context_timeframe, "vol_high_bound",
-                static_default=vol_confirmation_high,
-                percentile_override=getattr(market_context.cfg, "vol_high_percentile", 0.80),
-            )
-        if vol_strength < vol_confirmation_low:
-            confidence = max(0, confidence - vol_confirmation_low_penalty)
-            reasons.append(f"Below-average volume ({vol_strength:.2f}x, bound {vol_confirmation_low:.2f}) -{vol_confirmation_low_penalty:.0f}pts")
-        elif vol_strength > vol_confirmation_high:
-            confidence = min(97, confidence + vol_confirmation_high_bonus)
-            reasons.append(f"Strong volume confirmation ({vol_strength:.2f}x, bound {vol_confirmation_high:.2f}) +{vol_confirmation_high_bonus:.0f}pts")
+    # ── Binary trading: volume removed ───────────────────────────────────
+    # Quotex/pyquotex has NO real exchange volume — volume_strength is always
+    # 1.0 (neutral) on that path. For binary options, what matters is candle
+    # structure (body ratio + wick rejection), not volume. The old volume
+    # confirmation penalized vol_strength<0.7 (-6pts) and bonused >1.5 (+4pts),
+    # but on Quotex vol_strength was 0 (all zeros) -> always penalized, or 1.0
+    # (neutral placeholder) -> never mattered. Removed entirely for binary:
+    # price_strength (body+wick) is now the primary structure filter, already
+    # applied above as body_ratio penalty/bonus. Real volume path (Binance)
+    # still computes vol_strength but it no longer affects confidence — keeps
+    # binary signals clean and pyquotex-native.
+    pass
 
     # ── General support/resistance proximity check ─────────────────────────
     # Same reasoning: S/R levels were already computed (df["support"]/

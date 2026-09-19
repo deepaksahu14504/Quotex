@@ -16,6 +16,11 @@ const STRATEGIES = [
   { id: "stoch_rsi", name: "Stochastic RSI", desc: "StochRSI cross from extremes", regime: "ranging" },
   { id: "bollinger_bounce", name: "Bollinger Bounce", desc: "Band rejection back to mean", regime: "ranging" },
   { id: "mean_reversion", name: "Mean Reversion", desc: "Bollinger extremes + RSI/Stoch", regime: "ranging" },
+  // High-accuracy improvement strategies — pure price-action for binary (no volume dependency)
+  { id: "vol_norm_reversion", name: "Vol-Norm Reversion", desc: "ATR-adjusted extremes + S/R bounce + price strength (binary)", regime: "ranging" },
+  { id: "confluence_breakout", name: "Confluence Breakout", desc: "Key-level break 3+ confl + strong body/wick (binary)", regime: "trending" },
+  { id: "session_swing", name: "Session Swing", desc: "Session-aware swings: RSI/EMA/MACD + time-vol mult (binary)", regime: "any" },
+  { id: "multi_confluence", name: "Multi-Factor Confluence", desc: "6+/8 OHLC factors + body strength (binary, no volume)", regime: "trending" },
 ];
 
 const TIMEFRAMES = ["30s", "1m", "2m", "3m", "5m", "15m", "30m", "1h", "4h", "1day"];

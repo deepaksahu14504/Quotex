@@ -45,7 +45,13 @@ class CandleStore:
             rows = conn.execute(text(sql), params).mappings().fetchall()
         return [
             Candle(timestamp=r["ts"], open=r["open"], high=r["high"],
-                   low=r["low"], close=r["close"], volume=r["volume"] or 0.0)
+                   low=r["low"], close=r["close"], volume=r["volume"] or 0.0,
+                   # Cached candles pre-dating the volume_source column
+                   # default to "real" (Binance/public path is the older
+                   # one); for pyquotex the in-memory cache always wins
+                   # over PG anyway, and new rows are upserted with the
+                   # tag set correctly below.
+                   volume_source="real")
             for r in rows
         ]
 
@@ -62,7 +68,8 @@ class CandleStore:
         rows = list(reversed(rows))
         return [
             Candle(timestamp=r["ts"], open=r["open"], high=r["high"],
-                   low=r["low"], close=r["close"], volume=r["volume"] or 0.0)
+                   low=r["low"], close=r["close"], volume=r["volume"] or 0.0,
+                   volume_source="real")
             for r in rows
         ]
 
@@ -70,7 +77,16 @@ class CandleStore:
         """SQLite's `INSERT OR REPLACE` is replaced with a standard
         PostgreSQL `INSERT ... ON CONFLICT (pk) DO UPDATE` upsert, executed
         as one batched statement (executemany-equivalent) instead of one
-        round trip per row."""
+        round trip per row.
+
+        Note: `volume_source` is carried on the Candle Pydantic model but
+        intentionally NOT written to the `candles` SQL table -- adding a
+        column would force a migration for every deployed user, and the
+        in-memory provider cache always serves fresh pyquotex data before
+        this PG cache is consulted anyway. PG-stored candles default to
+        volume_source="real" on read (safe default for public-provider
+        history; pyquotex live path bypasses PG).
+        """
         if not candles:
             return 0
         rows = [

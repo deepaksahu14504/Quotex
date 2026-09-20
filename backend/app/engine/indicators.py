@@ -197,6 +197,9 @@ def psar(df: pd.DataFrame, step: float = 0.02, max_step: float = 0.2) -> pd.Seri
 
 
 _OHLCV_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
+# Optional metadata column carried alongside OHLCV; not an OHLC column but
+# preserved through candles_to_df so _has_real_volume can read it.
+_VOLUME_SOURCE_COLUMN = "_volume_source"
 
 
 def candles_to_df(candles) -> pd.DataFrame:
@@ -231,19 +234,33 @@ def candles_to_df(candles) -> pd.DataFrame:
     rows = []
     for c in candles:
         if hasattr(c, "open"):
-            rows.append((c.timestamp, c.open, c.high, c.low, c.close, getattr(c, "volume", 0.0)))
+            vol = getattr(c, "volume", 0.0)
+            # Pydantic Candle schema: volume_source defaults to "real" so
+            # older/external callers keep Binance-style behaviour.
+            vsrc = getattr(c, "volume_source", "real")
+            rows.append((c.timestamp, c.open, c.high, c.low, c.close, vol, vsrc))
         else:
-            rows.append((c["timestamp"], c["open"], c["high"], c["low"], c["close"], c.get("volume", 0.0)))
-    df = pd.DataFrame(rows, columns=_OHLCV_COLUMNS)
+            vol = c.get("volume", 0.0)
+            vsrc = c.get("volume_source",
+                        # Legacy dict cache from market.py uses
+                        # "_volume_source" (prefixed to avoid collision
+                        # with broker fields); fall back to "real" so
+                        # dict-based callers without the tag stay safe.
+                        c.get("_volume_source", "real"))
+            rows.append((c["timestamp"], c["open"], c["high"], c["low"], c["close"], vol, vsrc))
+    df = pd.DataFrame(rows, columns=_OHLCV_COLUMNS + [_VOLUME_SOURCE_COLUMN])
     if df.empty:
         # Force the numeric dtypes an empty frame would otherwise not have.
-        return df.astype({c: "float64" for c in _OHLCV_COLUMNS})
+        return df.astype({**{c: "float64" for c in _OHLCV_COLUMNS},
+                          _VOLUME_SOURCE_COLUMN: "object"})
 
     for col in _OHLCV_COLUMNS:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[_VOLUME_SOURCE_COLUMN] = df[_VOLUME_SOURCE_COLUMN].fillna("real").astype(str)
     df = df.dropna(subset=["timestamp", "open", "high", "low", "close"])
     if df.empty:
-        return df.astype({c: "float64" for c in _OHLCV_COLUMNS}).reset_index(drop=True)
+        return df.astype({**{c: "float64" for c in _OHLCV_COLUMNS},
+                          _VOLUME_SOURCE_COLUMN: "object"}).reset_index(drop=True)
 
     # kind="stable" so equal timestamps keep their arrival order, which is
     # what makes "last occurrence wins" below mean "most recent read".
@@ -365,14 +382,43 @@ def find_support_resistance(
 # ═════════════════════════════════════════════════════════════════════════ #
 
 def _has_real_volume(df: pd.DataFrame) -> bool:
-    """Quotex (pyquotex) has no real exchange volume — ticks carry no volume.
-    Binance/public provider does. This helper tells whether volume column is
-    meaningful (variance) or just 0/constant placeholder from Quotex."""
+    """Does the `volume` column carry real exchange volume?
+
+    Two data paths feed this engine:
+      * Binance/Bybit public provider  -> genuine order-flow volume (real).
+      * Quotex/pyquotex binary broker  -> NO real volume; what we fill in
+        is a *tick-count per bucket* proxy so the frontend has an activity
+        number. Tick count varies, has nunique()>1 and sum()>0, so the old
+        heuristic ("variance + sum") MISCLASSIFIED it as real, which then
+        fed synthetic tick counts into volume_ma/volume_strength as if they
+        were order flow -- mathematically invalid and produced bogus
+        confidence bonuses/penalties on pyquotex.
+
+    The market provider now tags every Candle with a `volume_source` of
+    "real" or "synthetic". We honour that tag first; if no tag is present
+    (external/custom provider, older in-memory frames), we fall back to
+    the variance+sum heuristic so we don't break unknown providers.
+    """
     if "volume" not in df.columns:
         return False
+    # Primary signal: explicit tag from the provider.
+    if _VOLUME_SOURCE_COLUMN in df.columns:
+        try:
+            # If ANY candle is tagged "real" we treat the series as real --
+            # a synthetic-tagged series cannot become real mid-frame, but a
+            # mixed frame (shouldn't happen, but defensively) means we have
+            # at least some real volume data.
+            if (df[_VOLUME_SOURCE_COLUMN] == "real").any():
+                # But still need the numbers to be numeric/nonzero.
+                vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+                return bool(vol.nunique() > 1 and vol.sum() > 0)
+            # Every candle is tagged synthetic (pyquotex path): neutral.
+            return False
+        except Exception:
+            pass
+    # Fallback: legacy heuristic for frames that pre-date the tag.
     try:
         vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-        # meaningful if more than 1 unique value and sum>0 and not all 1.0 placeholder
         return bool(vol.nunique() > 1 and vol.sum() > 0)
     except Exception:
         return False

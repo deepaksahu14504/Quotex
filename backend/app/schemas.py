@@ -35,6 +35,15 @@ class Candle(BaseModel):
     low: float
     close: float
     volume: float = 0.0
+    # "real"       = genuine exchange volume (Binance/Bybit klines carry it).
+    # "synthetic"  = tick-count proxy or 0 placeholder (Quotex/pyquotex path —
+    #                broker does not publish real order-book volume; we count
+    #                ticks per bucket so the UI still sees an activity number).
+    # Indicators/strategies MUST treat "synthetic" volume as neutral (volume
+    # gates return 1.0) — applying real-volume maths to tick counts is not
+    # mathematically valid. Defaults to "real" so existing callers/tests that
+    # don't set the flag keep their existing behaviour.
+    volume_source: str = "real"
 
 
 class AssetInfo(BaseModel):

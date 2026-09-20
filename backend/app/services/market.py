@@ -1590,17 +1590,40 @@ class PyQuotexProvider(MarketProvider):
                     stored = 0
                     for c in hist or []:
                         if isinstance(c, dict) and "time" in c:
-                            # Binary: Quotex history has no real volume, but has tick count.
-                            # Use ticks as volume proxy so live indicators have *some* activity measure.
-                            # For binary trading we now treat volume as neutral (indicators return 1.0
-                            # when no real volume), but keeping tick count preserves info for Binance path
-                            # and for future analysis without breaking binary logic.
-                            if "volume" not in c or not c.get("volume"):
+                            # Binary (Quotex/pyquotex) has NO real exchange volume.
+                            # The broker only returns a per-candle TICK count, which
+                            # looks like real volume if we pass it through verbatim:
+                            # it varies, has nunique()>1, and passes the nunique/sum
+                            # heuristic in indicators._has_real_volume, which then
+                            # feeds it into volume_ma / volume_strength as if it were
+                            # order-flow data. Tick count correlates with activity
+                            # but is NOT volume -- applying volume-based confidence
+                            # penalties/bonuses to it is mathematically wrong.
+                            #
+                            # We tag the tick-count proxy explicitly so
+                            # _has_real_volume can distinguish "real exchange volume"
+                            # (Binance/Bybit) from "synthetic tick-count activity
+                            # measure" (pyquotex). The numeric value stays as the
+                            # tick count so the frontend still sees a meaningful
+                            # activity number in the volume field.
+                            c_real_vol = False
+                            try:
+                                raw_v = c.get("volume")
+                                if raw_v is None or raw_v == "" or float(raw_v) == 0.0:
+                                    c_real_vol = False
+                                else:
+                                    c_real_vol = True
+                            except (TypeError, ValueError):
+                                c_real_vol = False
+                            if not c_real_vol:
                                 if "ticks" in c:
                                     try:
                                         c["volume"] = float(c["ticks"])
                                     except Exception:
                                         c["volume"] = 0.0
+                                else:
+                                    c["volume"] = 0.0
+                            c["_volume_source"] = "real" if c_real_vol else "synthetic"
                             cache[float(c["time"])] = c
                             stored += 1
                     log_event(logger, logging.INFO, "HISTORY_STORED",
@@ -1632,12 +1655,22 @@ class PyQuotexProvider(MarketProvider):
                 )
                 for c in raw or []:
                     if isinstance(c, dict) and "time" in c:
-                        if "volume" not in c or not c.get("volume"):
+                        c_real_vol = False
+                        try:
+                            raw_v = c.get("volume")
+                            if raw_v is not None and raw_v != "" and float(raw_v) != 0.0:
+                                c_real_vol = True
+                        except (TypeError, ValueError):
+                            c_real_vol = False
+                        if not c_real_vol:
                             if "ticks" in c:
                                 try:
                                     c["volume"] = float(c["ticks"])
                                 except Exception:
                                     c["volume"] = 0.0
+                            else:
+                                c["volume"] = 0.0
+                        c["_volume_source"] = "real" if c_real_vol else "synthetic"
                         cache[float(c["time"])] = c
             except asyncio.CancelledError:
                 raise
@@ -1670,15 +1703,22 @@ class PyQuotexProvider(MarketProvider):
                 bucket = float(int(ts // period * period))
                 row = cache.get(bucket)
                 if row is None:
-                    # Binary: open=new tick, volume=1 (tick count proxy)
-                    cache[bucket] = {"time": bucket, "open": price, "high": price, "low": price, "close": price, "volume": 1.0, "ticks": 1}
+                    # Binary: open=new tick, volume=tick count (synthetic proxy).
+                    # Tagged _volume_source="synthetic" so indicators know this
+                    # is tick-count activity, not real exchange volume.
+                    cache[bucket] = {"time": bucket, "open": price, "high": price,
+                                     "low": price, "close": price, "volume": 1.0,
+                                     "ticks": 1, "_volume_source": "synthetic"}
                 else:
                     row["close"] = price
                     row["high"] = max(row["high"], price)
                     row["low"] = min(row["low"], price)
-                    # Increment tick-count volume proxy — gives *some* activity measure for live candle
-                    # For binary we treat volume as neutral (indicators return 1.0 when no variance),
-                    # but counting ticks is still useful and matches how Binance volume works.
+                    # Increment tick-count volume proxy — gives an activity
+                    # measure for the live candle. Because this is built from
+                    # raw ticks it is ALWAYS synthetic (pyquotex tick frames
+                    # have no volume field at all, see api.py:790).
+                    if row.get("_volume_source") != "real":
+                        row["_volume_source"] = "synthetic"
                     try:
                         row["volume"] = float(row.get("volume", 0) or 0) + 1.0
                         row["ticks"] = int(row.get("ticks", 0) or 0) + 1
@@ -1696,13 +1736,18 @@ class PyQuotexProvider(MarketProvider):
         for c in rows:
             try:
                 vol = c.get("volume", 0) or 0
+                v_src = c.get("_volume_source") or "synthetic"
                 if not vol and "ticks" in c:
                     try:
                         vol = float(c["ticks"])
                     except Exception:
                         vol = 0
+                # If the broker somehow returned a real volume field > 0,
+                # honour it; otherwise everything pyquotex produces here is
+                # tick-count proxy.
                 out.append(Candle(timestamp=float(c["time"]), open=float(c["open"]), high=float(c["high"]),
-                                  low=float(c["low"]), close=float(c["close"]), volume=float(vol)))
+                                  low=float(c["low"]), close=float(c["close"]), volume=float(vol),
+                                  volume_source=v_src))
             except Exception:
                 continue
         return out
@@ -1733,6 +1778,13 @@ class PyQuotexProvider(MarketProvider):
         out: List[Candle] = []
         for c in rows[-bars:]:
             try:
+                c_real_vol = False
+                try:
+                    raw_v = c.get("volume")
+                    if raw_v is not None and raw_v != "" and float(raw_v) != 0.0:
+                        c_real_vol = True
+                except (TypeError, ValueError):
+                    c_real_vol = False
                 vol = c.get("volume", 0) or 0
                 if not vol and "ticks" in c:
                     try:
@@ -1740,7 +1792,8 @@ class PyQuotexProvider(MarketProvider):
                     except Exception:
                         vol = 0
                 out.append(Candle(timestamp=float(c["time"]), open=float(c["open"]), high=float(c["high"]),
-                                  low=float(c["low"]), close=float(c["close"]), volume=float(vol)))
+                                  low=float(c["low"]), close=float(c["close"]), volume=float(vol),
+                                  volume_source="real" if c_real_vol else "synthetic"))
             except Exception:
                 continue
         return out

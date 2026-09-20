@@ -68,7 +68,10 @@ def make_provider(client):
     p._stream_tick_ts = {}
     p._last_resync = {}
     p._cache_lru = []
+    p._seed_plateaued_at = {}
+    p._asset_feed = None
     p._tick_watcher_task = None
+    p._tournament_id = None
     p.new_data_event = asyncio.Event()
     return p
 
@@ -125,15 +128,17 @@ async def test_cursor_is_a_timestamp_not_a_length():
     # Key is (asset, period), not asset. The cursor used to be shared
     # across timeframes, which starved whichever timeframe read second --
     # see test_transport_bounds.py::test_second_timeframe_is_not_starved_*.
-    # The value assertion (a timestamp, not a length) is unchanged; only
-    # the key shape moved.
-    assert p._stream_tick_ts[("EURUSD", 60)] == float(base + 199)
+    # The cursor VALUE is a (timestamp, index-in-buffer) tuple -- the
+    # timestamp component proves we are no longer using a position/length
+    # cursor (which would be <= 50 at buffer saturation).
+    cursor_ts, _ = p._stream_tick_ts[("EURUSD", 60)]
+    assert cursor_ts == float(base + 199)
 
 
 @pytest.mark.asyncio
 async def test_same_second_ticks_are_not_dropped():
-    """Cursor comparison is >=, so several ticks sharing one timestamp
-    all fold in; > would silently lose them."""
+    """Same-second ticks after the previous fold must still be picked up;
+    strict `>` without an in-timestamp position counter would lose them."""
     buf = BrokerBuffer()
     p = make_provider(FakeClient(buf))
     p._streamed.add(("EURUSD", 60))

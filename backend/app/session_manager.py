@@ -27,6 +27,34 @@ from .security import decrypt, encrypt
 # this as due for a proactive re-login attempt (soft TTL, not a hard cutoff).
 SESSION_SOFT_TTL = 60 * 60 * 20  # 20 hours
 
+# Broker account types the vendor library accepts. Tournament is NOT one of
+# them: pyquotex layers a tournament on top of PRACTICE via
+# change_account("PRACTICE", tournament_id=...), so `account_type` only ever
+# records PRACTICE vs REAL. Tournament routing is persisted in
+# runtime_settings.json and re-applied on connect.
+ACCOUNT_TYPE_PRACTICE = "PRACTICE"
+ACCOUNT_TYPE_REAL = "REAL"
+
+
+def account_type_for(is_demo: bool) -> str:
+    """Map the app's demo/live flag onto the broker's account type.
+
+    Split out of `save_credentials` so the PRACTICE<->REAL contract has a
+    single definition and can be unit tested without a database.
+    """
+    return ACCOUNT_TYPE_PRACTICE if is_demo else ACCOUNT_TYPE_REAL
+
+
+def is_demo_for(account_type: Optional[str]) -> bool:
+    """Inverse of `account_type_for`.
+
+    Anything other than exactly "REAL" -- including NULL, which is the
+    column's pre-default state -- is treated as PRACTICE, so a missing or
+    unrecognised value fails towards the demo account rather than towards
+    placing real-money orders.
+    """
+    return (account_type or "") != ACCOUNT_TYPE_REAL
+
 
 @dataclass
 class BrokerCredentials:
@@ -89,10 +117,46 @@ class SessionManager:
                     "email_enc": encrypt(email),
                     "password_enc": encrypt(password),
                     "user_agent": user_agent,
-                    "account_type": "PRACTICE" if is_demo else "REAL",
+                    "account_type": account_type_for(is_demo),
                     "now": now,
                 },
             )
+
+    def set_account_type(self, user_id: str, is_demo: bool) -> bool:
+        """Persist ONLY the demo/live account type.
+
+        RCA F4: `switch_account_mode()` switched the live connection and
+        updated runtime_settings.json, but nothing ever rewrote
+        `broker_sessions.account_type`. After a Demo -> Live switch and a
+        restart, `_broker_settings()` read the STALE "PRACTICE" row and
+        `build_provider()` rebuilt the provider against the DEMO account --
+        while the UI and every `TradeRecord.is_demo` still said LIVE.
+
+        Deliberately separate from `save_credentials`: a mode switch must not
+        re-encrypt or overwrite the stored email/password/user-agent, and it
+        must not resurrect a NULL column into an empty string.
+
+        Returns False when there is no row to update (no credentials saved
+        yet), so the caller can tell "nothing to persist" from "persisted".
+        """
+        now = time.time()
+        with db.tx() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    UPDATE broker_sessions
+                       SET account_type = :account_type,
+                           updated_at = :now
+                     WHERE user_id = :user_id
+                    """
+                ),
+                {
+                    "user_id": user_id,
+                    "account_type": account_type_for(is_demo),
+                    "now": now,
+                },
+            )
+            return bool(getattr(result, "rowcount", 0))
 
     def save_session_token(self, user_id: str, ssid: Optional[str], cookies: Optional[str] = None,
                             expires_at: Optional[float] = None) -> None:
@@ -135,7 +199,7 @@ class SessionManager:
         return BrokerCredentials(
             quotex_email=decrypt(row["email_enc"]),
             quotex_password=decrypt(row["password_enc"]),
-            quotex_is_demo=(row["account_type"] != "REAL"),
+            quotex_is_demo=is_demo_for(row["account_type"]),
             quotex_ssid=decrypt(row["ssid_enc"]),
             quotex_user_agent=row["user_agent"],
             quotex_cookies=decrypt(row["cookies_enc"]),

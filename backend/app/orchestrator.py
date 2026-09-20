@@ -124,6 +124,14 @@ PROVIDER_CONNECT_TIMEOUT_SECONDS = 60.0      # ceiling for the initial/reconnect
                                               # pyquotex's own internal retry-polling (see services/market.py);
                                               # this is a backstop for a genuine hang, not a normal-latency trip
 
+# Ceiling for ONE settlement check in _result_loop (RCA F8). Two layers matter
+# here: the provider imposes its own CHECK_RESULT_TIMEOUT (30s) around
+# pyquotex's check_win, and this is the outer backstop covering a provider that
+# ignores it or hangs somewhere else entirely. It must stay well below
+# pyquotex's internal 300s, because that call returns ("loss", 0.0) when it
+# gives up -- a timeout must surface as "still pending", never as a loss.
+RESULT_CHECK_TIMEOUT = 45.0
+
 logger = logging.getLogger("orchestrator")
 
 def signal_ttl_seconds(timeframe: str, regime: Optional[str]) -> float:
@@ -496,6 +504,26 @@ class Orchestrator:
         """
         creds = session_manager.get_credentials(self.user_id)
         if creds and (creds.quotex_email or creds.quotex_ssid):
+            # RCA F4: `runtime.trading.is_demo` is the mode the user actually
+            # selected (it drives the UI, TradeRecord.is_demo and
+            # account-mode switching), so on a restart it must win over
+            # whatever `broker_sessions.account_type` happens to say. Before
+            # `switch_account_mode` also called `set_account_type`, those two
+            # disagreed after any Demo <-> Live switch, and the provider came
+            # back up on the WRONG account while everything else said
+            # otherwise. Rows written before that fix are reconciled here.
+            stored_is_demo = creds.quotex_is_demo
+            selected_is_demo = bool(self.runtime.trading.is_demo)
+            if stored_is_demo != selected_is_demo:
+                log_event(
+                    logger, logging.WARNING, "account_mode_reconciled",
+                    user_id=self.user_id,
+                    stored_account_type="REAL" if not stored_is_demo else "PRACTICE",
+                    selected_account_mode=self.runtime.trading.account_mode,
+                    reason="broker_sessions.account_type disagreed with the saved "
+                           "account mode -- using the saved account mode",
+                )
+                creds.quotex_is_demo = selected_is_demo
             return creds
         return BrokerCredentials()  # empty -> build_provider falls back to paper/demo data
 
@@ -735,6 +763,73 @@ class Orchestrator:
                 task.cancel()
                 raise asyncio.TimeoutError()
 
+    async def _reapply_account_mode(self) -> None:
+        """Re-assert the persisted account mode on the freshly connected
+        session. RCA F4.
+
+        Why this exists: `_connect_provider` used to re-apply ONLY tournament
+        routing. Demo/Live was assumed to be whatever the provider was built
+        with, and the provider is built from `broker_sessions.account_type` --
+        a column nothing updated on a mode switch. So after Demo -> Live and a
+        restart (or any reconnect), the bot traded the DEMO account while the
+        UI, `state.is_demo` and every `TradeRecord.is_demo` reported LIVE.
+
+        Failure handling is asymmetric on purpose. Coming up on DEMO when the
+        user asked for LIVE wastes nothing but produces a trade log that lies;
+        coming up on LIVE when the user asked for DEMO risks real money. So a
+        failed re-apply towards LIVE pauses trading outright instead of
+        logging a warning and carrying on.
+        """
+        mode = (self.runtime.trading.account_mode or "demo").lower()
+        tournament_id = self.runtime.trading.tournament_id
+
+        if mode == "tournament" and not tournament_id:
+            # Nothing to route into; fall through to plain demo rather than
+            # leaving the session on an unknown account.
+            mode = "demo"
+
+        want_demo = mode in ("demo", "tournament")
+        try:
+            switched = await self.provider.switch_account(mode, tournament_id)
+        except Exception as exc:
+            switched = False
+            logger.warning("[account] re-apply of %s on connect raised: %s", mode, exc)
+
+        if switched:
+            # Keep the in-memory flags honest even when the provider was built
+            # from a stale account_type (rows written before set_account_type
+            # existed). The provider's own switch_account() already updates its
+            # _is_demo/_tournament_id; this covers providers that do not.
+            self.state.is_demo = want_demo
+            self.state.account_mode = mode
+            self.state.tournament_id = tournament_id if mode == "tournament" else None
+            if self.state.is_demo != bool(self.runtime.trading.is_demo):
+                self.runtime.trading.is_demo = self.state.is_demo
+                self.runtime.save(self.user_id)
+            return
+
+        log_event(
+            logger, logging.ERROR, "account_mode_reapply_failed",
+            user_id=self.user_id, account_mode=mode, tournament_id=tournament_id,
+            reason="provider.switch_account() did not confirm the account mode "
+                   "after connect -- refusing to trade on an unverified account",
+        )
+        if want_demo:
+            # Wrong direction is harmless-but-wrong: tell the user, keep going.
+            await hub.broadcast(self.user_id, "error", {
+                "message": f"Could not confirm {mode.upper()} account routing after "
+                           f"reconnect -- check the account indicator before trusting P&L.",
+            })
+        else:
+            # LIVE could not be confirmed. Never place real orders on an
+            # account we cannot verify.
+            self.risk.pause(f"Account mode {mode.upper()} could not be verified after reconnect")
+            self._sync_counters()
+            await hub.broadcast(self.user_id, "error", {
+                "message": "Trading PAUSED: the LIVE account could not be verified after "
+                           "reconnect. Reconnect or re-save your Quotex credentials, then resume.",
+            })
+
     async def _connect_provider(self) -> None:
         self.state.stage = "authenticating"
         self._connect_in_progress = True
@@ -777,15 +872,13 @@ class Orchestrator:
             except Exception:
                 pass
             await asyncio.to_thread(self._persist_broker_session)
-            if self.runtime.trading.account_mode == "tournament" and self.runtime.trading.tournament_id:
-                try:
-                    switched = await self.provider.switch_account("tournament", self.runtime.trading.tournament_id)
-                    if not switched:
-                        log_event(logger, logging.WARNING, "tournament_unavailable", user_id=self.user_id,
-                                  tournament_id=self.runtime.trading.tournament_id,
-                                  reason="failed to re-apply tournament routing after (re)connect")
-                except Exception:
-                    logger.debug("[account] tournament re-apply on connect failed", exc_info=True)
+            # RCA F4: re-apply the FULL persisted account mode on every
+            # connect, not just tournament. The old code had a single
+            # `if account_mode == "tournament"` branch, so a reconnect or a
+            # restart after a Demo <-> Live switch came back up on whatever
+            # account the provider happened to be constructed with -- with no
+            # log line and no UI signal saying it had changed.
+            await self._reapply_account_mode()
             self.state.stage = "running"
         await self.broadcast_state()
 
@@ -2566,6 +2659,43 @@ class Orchestrator:
         self.runtime.trading.is_demo = self.state.is_demo
         self.runtime.save(self.user_id)
 
+        # RCA F4: also persist the account type WHERE A RESTART READS IT FROM.
+        # runtime_settings.json drives the UI and TradeRecord.is_demo, but
+        # `build_provider()` is fed by `broker_sessions.account_type` via
+        # `_broker_settings()`. Updating only the former meant a Demo -> Live
+        # switch survived in the UI and in the trade log, while the next
+        # restart rebuilt the provider against the DEMO account -- real orders
+        # silently became paper ones (and a Live -> Demo switch would have
+        # placed REAL orders on restart). `set_account_type` touches only that
+        # column, so the stored email/password/user-agent are untouched.
+        try:
+            persisted = await asyncio.to_thread(
+                session_manager.set_account_type, self.user_id, self.state.is_demo
+            )
+            if not persisted:
+                log_event(
+                    logger, logging.WARNING, "account_type_not_persisted",
+                    user_id=self.user_id, account_mode=account_mode,
+                    reason="no broker_sessions row for this user -- the account "
+                           "mode will not survive a restart until credentials are saved",
+                )
+        except Exception:
+            # A DB failure must not undo a switch the broker already accepted
+            # (the connection is now genuinely on the new account), but it
+            # must be loud: the mode will silently revert on the next restart.
+            log_event(
+                logger, logging.ERROR, "account_type_persist_failed",
+                user_id=self.user_id, account_mode=account_mode,
+                reason="failed to update broker_sessions.account_type -- the "
+                       "account mode will NOT survive a restart",
+                exc_info=True,
+            )
+            await hub.broadcast(self.user_id, "notice", {
+                "message": f"Switched to {account_mode.upper()}, but the account mode could not "
+                           f"be saved -- it will revert after a restart. Re-save your Quotex "
+                           f"credentials in Settings.",
+            })
+
         log_event(
             logger, logging.INFO, "account_switched",
             user_id=self.user_id, previous_mode=previous_mode, previous_tournament_id=previous_tournament,
@@ -3747,11 +3877,72 @@ class Orchestrator:
             sig.status = "skipped"
             self.latency.drop(signal_id)
 
+    async def _bounded_check_result(self, oid: str):
+        """One settlement check under a hard ceiling.
+
+        RCA F8: `_result_loop` used to `await self.provider.check_result(oid)`
+        bare, and pyquotex's `check_win` blocks for up to 300s before giving
+        up. Because the checks ran one after another inside the `for` loop, a
+        single slow confirmation stalled every other open trade behind it --
+        at `max_concurrent_trades=3` one pass could take ~900s, so trades sat
+        unresolved, `active_trades` stayed full, and `can_trade()` refused new
+        signals on the max_concurrent gate long after those trades had really
+        closed.
+
+        Measured, not estimated: the settlement test module runs in ~2.6s with
+        this ceiling in place and ~306s without it, because one case waits out
+        the vendor's full 300s.
+
+        Returns None when the outcome is not yet known, which the caller
+        treats as "leave it pending" -- never as a loss.
+        """
+        try:
+            return await asyncio.wait_for(
+                self.provider.check_result(oid), RESULT_CHECK_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log_event(
+                logger, logging.WARNING, "result_check_timeout",
+                user_id=self.user_id, order_id=str(oid),
+                timeout_seconds=RESULT_CHECK_TIMEOUT,
+                reason="settlement check exceeded its ceiling -- trade left "
+                       "pending for the next pass",
+            )
+            return None
+
+    async def _collect_results(self) -> List[tuple]:
+        """Fetch every open trade's result CONCURRENTLY, then hand them back
+        for sequential bookkeeping.
+
+        Concurrency is applied only to the network wait. The bookkeeping that
+        follows stays strictly one trade at a time in the caller, because it
+        mutates shared state -- `risk.record_result`, `state.balance`,
+        `active_trades`, the strategy manager -- and running that in parallel
+        would trade a latency bug for a correctness one.
+        """
+        pending = list(self.active_trades.items())
+        if not pending:
+            return []
+        outcomes = await asyncio.gather(
+            *(self._bounded_check_result(oid) for oid, _ in pending),
+            return_exceptions=True,
+        )
+        settled: List[tuple] = []
+        for (oid, trade), outcome in zip(pending, outcomes):
+            if isinstance(outcome, BaseException):
+                logger.warning("check_result failed for trade %s: %s", oid, outcome)
+                continue
+            settled.append((oid, trade, outcome))
+        return settled
+
     async def _result_loop(self) -> None:
         while self._running:
-            for oid, trade in list(self.active_trades.items()):
+            # RCA F8: gather first, apply second. See _collect_results().
+            for oid, trade, result in await self._collect_results():
                 try:
-                    result = await self.provider.check_result(oid)
+                    if oid not in self.active_trades:
+                        # Settled or cancelled while the checks were in flight.
+                        continue
                     if not result:
                         continue
                     status = result["status"]

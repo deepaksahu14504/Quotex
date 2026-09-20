@@ -436,6 +436,13 @@ class PublicDataProvider(MarketProvider):
 ASSET_SNAPSHOT_STALE_TTL = 60.0
 
 PROVIDER_IO_TIMEOUT = 20.0        # a single subscribe / candle pull
+
+# Ceiling for one `check_win` call (RCA F7). pyquotex waits up to 300s
+# internally and then reports ("loss", 0.0), which is indistinguishable from a
+# genuine loss -- so we bail out long before that and leave the trade pending.
+# 30s is ample: a settled deal arrives within seconds of expiry, and the
+# result loop re-polls every couple of seconds anyway.
+CHECK_RESULT_TIMEOUT = 30.0
 PROVIDER_SEED_TIMEOUT = 45.0      # deep-history seed: chunked, legitimately slower.
                                   # Treated as the budget for a ~60-candle pull and
                                   # scaled up from there -- see get_candles().
@@ -1839,15 +1846,82 @@ class PyQuotexProvider(MarketProvider):
         return oid, open_price
 
     async def check_result(self, order_id: str):
+        """Resolve one order. Returns a result dict, or None when the outcome
+        is NOT YET KNOWN -- and "not yet known" must never be reported as a
+        loss (RCA F7).
+
+        Two defects fixed here:
+
+        1. THE VENDOR'S TIMEOUT LOOKED LIKE A LOSS. pyquotex's
+           `check_win()` returns the literal tuple `("loss", 0.0)` in three
+           situations that have nothing to do with losing: `self.api is None`,
+           an empty result payload, and -- the important one -- its own
+           internal `slot.wait(timeout=300)` giving up after five minutes
+           (_api/trading.py:216-217). The old code passed that straight
+           through, so a trade whose confirmation was merely slow got booked
+           as a $0 LOSS. We now impose our own, much shorter ceiling and
+           return None on timeout, leaving the trade pending for the next
+           pass. Retrying is safe and cheap: `check_win` has a cached
+           fast-path via `listinfodata`, and `release_win_result()` only pops
+           the slot dict so a later `_on_message` simply recreates it -- no
+           result is lost by bailing out early.
+
+        2. TIES AND REFUNDS WERE LOSSES. pyquotex derives its verdict as
+           `win = "win" if profit > 0 else "loss"` in three separate places
+           (api.py:643, 718, 762), so a trade that returns the stake --
+           a tie, or a broker refund/void -- arrives as `("loss", 0.0)` and
+           was booked as a loss. That is not cosmetic: `record_result()`
+           increments `consecutive_losses` (three in a row auto-pauses the
+           bot) AND `_martingale_step`, which escalates the stake on the next
+           trade after one that lost nothing. The old `else "draw"` branch in
+           this function was unreachable, because the vendor only ever emits
+           the strings "win" and "loss" and both matched an earlier branch.
+
+           We therefore classify on the PROFIT SIGN, which is the
+           economically meaningful value, and treat exactly zero as a draw.
+           Verified against 25 real recorded trades in the repo's own
+           trade history: every `loss` has profit < 0 (e.g. -1.4, -5.8,
+           -6.6) and every `win` has profit > 0 (e.g. 4.968, 441.6) -- so
+           `profit` is signed net P&L, and zero can only mean "stake
+           returned". The vendor's string is kept only to log the anomaly if
+           it ever contradicts the money.
+        """
         try:
-            win, profit = await self._client.check_win(order_id)
+            win, profit = await asyncio.wait_for(
+                self._client.check_win(order_id), CHECK_RESULT_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log_event(
+                logger, logging.WARNING, "check_result_timeout",
+                order_id=str(order_id), timeout_seconds=CHECK_RESULT_TIMEOUT,
+                reason="broker did not confirm the outcome in time -- left "
+                       "pending rather than booked as a loss",
+            )
+            return None
         except Exception:
             return None
         if win is None:
             return None
+
+        amount = float(profit or 0)
+        if amount > 0:
+            status = "win"
+        elif amount < 0:
+            status = "loss"
+        else:
+            status = "draw"
+
         w = str(win).lower()
-        status = "win" if "win" in w or (isinstance(profit, (int, float)) and profit > 0 and "loss" not in w) else "loss" if "loss" in w else "draw"
-        return {"status": status, "profit": float(profit or 0), "close_price": None, "open_price": None}
+        vendor_says_win = "win" in w and "loss" not in w
+        if vendor_says_win != (status == "win"):
+            log_event(
+                logger, logging.WARNING, "check_result_verdict_mismatch",
+                order_id=str(order_id), vendor_verdict=w, profit=amount,
+                classified_as=status,
+                reason="broker verdict string disagrees with the profit sign "
+                       "-- classified on the money",
+            )
+        return {"status": status, "profit": amount, "close_price": None, "open_price": None}
 
 
 def build_provider(name: str, settings, otp_callback=None, sessions_dir: Optional[str] = None) -> MarketProvider:

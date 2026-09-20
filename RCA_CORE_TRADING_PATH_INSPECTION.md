@@ -362,7 +362,7 @@ Ran the repo's own `_enrich()` vs `IndicatorCache.get_enriched()` over the same 
   * `backend/data/users/1bc8ff81e17a4671a82d4feb64ce6749/pyquotex_sessions/session.json`
   * `backend/data/users/b28b7360c3ff4bc2911fb03d5ef5b563/pyquotex_sessions/session.json`
   * `backend/data/users/c072101029fb46bf9af00102993c0329/pyquotex_sessions/session.json`
-* **Contents (verified by parsing the JSON):** 40-character `token` (SSID) **plus** full `laravel_session=eyJpdiI6...` / `remember_web_59ba36addc2...` cookies for four real addresses: `deepaksahu14504@gm…`, `shimpipravin1999@gm…`, `deepaksahju14504@gm…`, `deepaksah.strad@gm…`
+* **Contents (verified by parsing the JSON):** 40-character `token` (SSID) **plus** full Laravel session cookies (`laravel_session` and `remember_web_*`, values redacted here) for four real addresses: `deepaksahu14504@gm…`, `shimpipravin1999@gm…`, `deepaksahju14504@gm…`, `deepaksah.strad@gm…`
 * **Why it happened:** `.gitignore` contains `sessions/` but **not** `pyquotex_sessions/`, and `backend/data/` is not ignored at all.
 * **Impact:** **anyone with read access to this repository can authenticate to those Quotex accounts without a password.** This is independent of every trading bug above and is the most urgent item in this report.
 * **Blocks trading:** No — but it can empty the account.

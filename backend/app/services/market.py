@@ -91,6 +91,26 @@ class MarketProvider:
         overrides this to True (real, code-verified capability -- not a
         guess)."""
         return False
+
+    async def get_realtime_sentiment(self, asset: str) -> Optional[dict]:
+        """Raw trader-sentiment payload for `asset`, or None if unavailable.
+
+        Optional by design. A provider that does not publish sentiment returns
+        None and the signal engine proceeds on OHLC alone -- absence of
+        sentiment is never treated as evidence against a trade. The payload is
+        returned UNNORMALISED: `market_features.normalize_sentiment()` owns the
+        buy/sell key handling and the bias maths, so providers never have to
+        agree on a shape.
+        """
+        return None
+
+    async def get_realtime_ticks(self, asset: str) -> List[dict]:
+        """Raw realtime price ticks for `asset`, or [] if unavailable.
+
+        These are *price updates*, not traded volume. Nothing downstream may
+        convert the count into a volume figure.
+        """
+        return []
     async def fetch_history(self, asset: str, timeframe: str, bars: int) -> List[Candle]:
         """Deep historical fetch for backtesting — independent of the small
         rolling cache get_candles() maintains for live scanning. Default
@@ -1229,6 +1249,57 @@ class PyQuotexProvider(MarketProvider):
     def get_asset_feed_status(self) -> dict:
         """Diagnostics for the asset universe. Read-only, no I/O."""
         return self._asset_feed.to_dict()
+
+    async def get_realtime_sentiment(self, asset: str) -> Optional[dict]:
+        """Raw trader-sentiment payload from the vendor's shared state.
+
+        Reads `api.realtime_sentiment[asset]`, which the vendor populates from
+        the broker's "sentiment" control frame (`api.py:363-369` handler,
+        registered at `api.py:171`). Non-blocking: this is a dict lookup on
+        state the websocket already wrote, so there is no network call and no
+        subscription to start from here.
+
+        Returns None -- not {} -- whenever sentiment is unavailable, so the
+        caller can tell "no sentiment" from "sentiment of zero". A missing or
+        disconnected client is not an error worth raising into the scan loop.
+        """
+        client = getattr(self, "_client", None)
+        if client is None or not self.connected():
+            return None
+        try:
+            payload = await asyncio.wait_for(
+                client.get_realtime_sentiment(asset), timeout=PROVIDER_IO_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log_event(logger, logging.DEBUG, "SENTIMENT_UNAVAILABLE",
+                      asset=asset, error=type(exc).__name__)
+            return None
+        if not isinstance(payload, dict) or not payload:
+            return None
+        return payload
+
+    async def get_realtime_ticks(self, asset: str) -> List[dict]:
+        """Raw price updates from the vendor's bounded tick buffer.
+
+        These are price updates, NOT traded volume: the tick frame is
+        `[asset, ts, price, direction]` (`api.py:790`) and carries no volume
+        field at all. Callers may count them as activity; none may present the
+        count as financial volume.
+        """
+        client = getattr(self, "_client", None)
+        if client is None or not self.connected():
+            return []
+        try:
+            ticks = await asyncio.wait_for(
+                client.get_realtime_price(asset), timeout=PROVIDER_IO_TIMEOUT
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return []
+        return list(ticks or [])
 
     async def get_assets(self) -> List[AssetInfo]:
         """Current tradable universe.

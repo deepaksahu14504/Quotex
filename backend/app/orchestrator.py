@@ -31,6 +31,13 @@ from .engine.error_recovery import ErrorRecovery, RetryConfig
 from .engine.task_supervisor import TaskSupervisor
 from .engine.health_score import HealthScoreManager
 from .engine.incremental import IndicatorCache
+from .engine.market_features import (
+    MarketFeatures,
+    QualityReport,
+    SentimentAdjustment,
+    sentiment_confidence_adjustment,
+)
+from .services.realtime_state import RealtimeStateManager
 from .engine.latency import LatencyTracker
 from .engine.precision_gate import evaluate_precision
 from .engine.queue_persistence import QueuePersistence
@@ -296,6 +303,14 @@ class Orchestrator:
         self.validation.correlation.threshold = runtime.risk.correlation_threshold
         self._live_regime: Dict[str, str] = {}  # asset -> current regime, for the status API
         self._indicators = IndicatorCache()
+        # Realtime tick-activity + sentiment state, keyed by (asset, timeframe).
+        # Constructed here rather than lazily so a settings reload cannot leave
+        # the scan loop holding a manager sized for the old limits.
+        _md = getattr(runtime, "market_data", None)
+        self._realtime = RealtimeStateManager(
+            max_ticks_per_bar=int(getattr(_md, "max_ticks_per_bar", 512)),
+            baseline_bars=int(getattr(_md, "tick_baseline_bars", 40)),
+        )
         self.latency = LatencyTracker()
         self.signal_validator = SignalQualityValidator(**self._reval_kwargs())  # Signal revalidation + quality checks
         # Per-user instances (NOT the module-level singletons in these files —
@@ -2213,6 +2228,134 @@ class Orchestrator:
             return False
         return True
 
+    async def _collect_market_features(
+        self,
+        asset_symbol: str,
+        tf: str,
+        edf,
+        direction_value: Optional[str] = None,
+    ) -> tuple[MarketFeatures, SentimentAdjustment]:
+        """Build the realtime feature bundle and the bounded sentiment nudge.
+
+        Deliberately total: every branch returns a usable bundle, because this
+        runs inside the scan loop and a sentiment/tick failure must never
+        prevent a signal that OHLC alone would have produced. When sentiment is
+        disabled (the default) no provider call is even made and the adjustment
+        is exactly 0.0, so the signal path is unchanged from before this layer
+        existed.
+        """
+        md = getattr(self.runtime, "market_data", None)
+        report = QualityReport()
+        features = MarketFeatures(asset=asset_symbol, timeframe=tf, quality=report)
+
+        try:
+            if edf is not None and len(edf) > 0:
+                last = edf.iloc[-1]
+                features.candle_ts = float(last.get("timestamp", 0.0) or 0.0)
+                features.price = float(last.get("close", 0.0) or 0.0)
+                features.indicators = edf
+            else:
+                report.add("insufficient_history")
+        except Exception:
+            report.add("malformed_ohlc")
+
+        period = float(TIMEFRAMES.get(tf, 60) or 60)
+
+        # ── tick activity ───────────────────────────────────────────────────
+        tick_enabled = bool(getattr(md, "tick_features_enabled", True))
+        if tick_enabled:
+            try:
+                ticks = await self.provider.get_realtime_ticks(asset_symbol)
+            except Exception:
+                ticks = []
+            try:
+                features.tick = self._realtime.observe_ticks(
+                    asset_symbol, tf, ticks, period_seconds=period, report=report,
+                )
+                last_ts = self._realtime.last_tick_ts(asset_symbol, tf)
+                max_age = float(getattr(md, "price_max_age_seconds", 90.0))
+                if last_ts and (time.time() - last_ts) > max_age:
+                    report.add("stale_price")
+            except Exception:
+                report.add("malformed_tick")
+
+        # ── sentiment (optional, bounded) ───────────────────────────────────
+        sent_enabled = bool(getattr(md, "sentiment_enabled", False))
+        max_age = float(getattr(md, "sentiment_max_age_seconds", 120.0))
+        if sent_enabled:
+            try:
+                payload = await self.provider.get_realtime_sentiment(asset_symbol)
+            except Exception:
+                payload = None
+            try:
+                features.sentiment = self._realtime.update_sentiment(
+                    asset_symbol, tf, payload, max_age_seconds=max_age,
+                )
+            except Exception:
+                pass
+            if not features.sentiment.available:
+                report.add("missing_sentiment")
+            elif features.sentiment.stale:
+                report.add("stale_sentiment")
+        else:
+            features.sentiment = self._realtime.sentiment(
+                asset_symbol, tf, max_age_seconds=max_age,
+            )
+
+        try:
+            adjustment = sentiment_confidence_adjustment(
+                features.sentiment,
+                direction=direction_value,
+                enabled=sent_enabled,
+                max_age_seconds=max_age,
+                min_strength=float(getattr(md, "sentiment_min_strength", 0.10)),
+                max_adjustment=float(getattr(md, "sentiment_max_confidence_adjustment", 4.0)),
+                disagreement_penalty=(
+                    None if getattr(md, "sentiment_disagreement_penalty", None) is None
+                    else float(md.sentiment_disagreement_penalty)
+                ),
+            )
+        except Exception:
+            adjustment = SentimentAdjustment(0.0, False, "error")
+        return features, adjustment
+
+    @staticmethod
+    def _market_features_log_fields(
+        features: Optional["MarketFeatures"],
+        sentiment_adj: Optional[SentimentAdjustment],
+        base_confidence: Optional[float] = None,
+        final_confidence: Optional[float] = None,
+        effective_threshold: Optional[float] = None,
+    ) -> dict:
+        """Structured observability fields for the realtime feature layer.
+
+        Carries asset / timeframe / candle ts / price / tick_activity /
+        sentiment buy-sell-bias-stale / data_quality / base_confidence /
+        sentiment_adjustment / final_confidence / effective_threshold so a
+        signal can be audited end to end from one log line.
+
+        Credentials, cookies, session paths and tokens are never included: the
+        field list is explicit and built only from feature values.
+        """
+        out: dict = {}
+        if features is not None:
+            try:
+                out.update(features.flat())
+            except Exception:
+                pass
+        if sentiment_adj is not None:
+            try:
+                out.update(sentiment_adj.as_dict())
+            except Exception:
+                pass
+        if base_confidence is not None:
+            out["base_confidence"] = base_confidence
+        if final_confidence is not None:
+            out["final_confidence"] = final_confidence
+        if effective_threshold is not None:
+            out["effective_threshold"] = effective_threshold
+        return out
+
     def _effective_confidence_threshold(self, payout_pct: float) -> float:
         """Breakeven win-rate for a given payout, plus a real-edge margin,
         floored at the user's flat confidence_threshold. e.g. 80% payout
@@ -3160,6 +3303,27 @@ class Orchestrator:
         contributing = [name for name, d in res.votes.items() if d == res.direction.value]
         regime_adj = self.regime_tracker.blended_adjustment(contributing, res.regime)
         adjusted_confidence = max(0, min(100, res.confidence + regime_adj))
+
+        # ── Realtime feature layer: bounded, optional sentiment nudge ───────
+        # Applied AFTER regime adjustment and BEFORE calibration, so the
+        # calibrator still sees one combined number and the existing threshold
+        # gate below is completely unchanged. `res.direction` is already chosen
+        # by the OHLC/indicator/confluence engine at this point — sentiment can
+        # only shade confidence by a capped few points, never pick or reverse
+        # the direction. With sentiment disabled (default) this is exactly 0.0.
+        base_confidence = adjusted_confidence
+        try:
+            features, sentiment_adj = await self._collect_market_features(
+                asset.symbol, tf, edf_eval, direction_value=res.direction.value,
+            )
+        except Exception:
+            features, sentiment_adj = None, SentimentAdjustment(0.0, False, "error")
+        if sentiment_adj.adjustment:
+            # `adjusted_confidence` is what Signal.raw_confidence is built from
+            # below, so the nudge is visible in the record without touching the
+            # Signal construction or the threshold gate.
+            adjusted_confidence = max(0, min(100, adjusted_confidence + sentiment_adj.adjustment))
+
         calibrated_confidence = self.calibrator.calibrate(adjusted_confidence, regime=res.regime) if getattr(self.runtime.trading, "calibration_enabled", True) else adjusted_confidence
         if live_confidence_model_prediction is not None:
             calibrated_confidence = int(round(max(0.0, min(100.0, (calibrated_confidence + live_confidence_model_prediction) / 2.0))))
@@ -3249,6 +3413,8 @@ class Orchestrator:
             confidence=sig.confidence, raw_confidence=sig.raw_confidence, regime=sig.regime,
             strategies=list(sig.strategy_votes.keys()), payout=sig.payout, is_otc=sig.is_otc,
             reason="cleared_evaluate_gate_and_confidence_threshold",
+            **self._market_features_log_fields(features, sentiment_adj, base_confidence,
+                                               calibrated_confidence, effective_threshold),
         )
         # Observability: start this signal's pipeline trace and record it in
         # production metrics. Earlier stages (data fetch, indicator calc)

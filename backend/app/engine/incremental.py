@@ -32,8 +32,58 @@ import pandas as pd
 from .indicators import (
     candles_to_df, find_support_resistance, volume_ma, volume_strength,
     volatility_ratio, price_action_strength, confluence_points,
-    time_session_volatility_multiplier,
+    time_session_volatility_multiplier, _VOLUME_SOURCE_COLUMN,
 )
+
+def _carry_volume_source(row: dict, raw, i: int) -> dict:
+    """Copy the `_volume_source` tag from the raw frame onto a hand-built row.
+
+    RCA F5. `candles_to_df()` tags every row with the provider's volume
+    source ("real" for Binance/Bybit order flow, "synthetic" for the
+    tick-count proxy pyquotex fills in), and `indicators._has_real_volume()`
+    honours that tag FIRST -- its own docstring explains that the
+    variance+sum fallback heuristic MISCLASSIFIES pyquotex tick counts as real
+    volume, because tick count varies, has nunique()>1 and sum()>0.
+
+    But `get_enriched()` below does not build its frame with
+    `candles_to_df`; it assembles each row by hand from the incremental
+    `SymbolState` and copied over only timestamp/open/high/low/close/volume.
+    The tag was silently dropped, so the LIVE trading frame had no
+    `_volume_source` column and fell through to exactly the heuristic the tag
+    exists to avoid -- feeding synthetic tick counts into volume_ma and
+    volume_strength as if they were order flow. Measured on 240 synthetic
+    pyquotex-style candles, last closed bar: vol_ma 23.85 vs 1.0 and
+    vol_strength 0.922 vs 1.0 against the vectorized path, and
+    `_has_real_volume` True instead of False. That undid PR #3's fix on the
+    live path only, so backtest and live disagreed.
+    """
+    if _VOLUME_SOURCE_COLUMN in getattr(raw, "columns", ()):
+        row[_VOLUME_SOURCE_COLUMN] = raw[_VOLUME_SOURCE_COLUMN].iloc[i]
+    return row
+
+
+# RCA F6: how many rows of raw history the bounded-tail derived columns are
+# computed over. TAIL_ROWS alone is NOT enough: volatility_ratio() takes
+# atr_pct.rolling(50).mean(), and with ATR(20) still warming up a 61-row frame
+# yields only ~41 usable values, so the whole column came back NaN and the
+# `.fillna(1.0)` inside it flattened vol_ratio to a constant 1.0 on the live
+# path while the vectorized path (which sees the full window) produced a real
+# multiplier.
+#
+# Measured convergence of vol_ratio against the vectorized reference on the
+# last closed bar of a 240-candle series (reference 1.022449):
+#     window  61 -> 1.000000  (constant, every bar -- the bug)
+#     window 120 -> 1.019878  (diff 2.6e-3, varies correctly)
+#     window 200 -> 1.022389  (diff 6.0e-5)
+#     window 240 -> 1.022449  (exact)
+# The residual is Wilder smoothing in atr(): it recurses over the whole series,
+# so a shorter warm-up leaves a small seed offset. 200 buys near-exact parity,
+# and because the broker's own history ceiling is around 120 candles this
+# costs nothing in production -- `base.tail(200)` simply returns whatever is
+# available. Measured warm-path cost at raw=120: 14.6ms -> 20.7ms per
+# get_enriched() call, which is the inherent price of computing over the real
+# window instead of a truncated one.
+DERIVED_WINDOW = 200
 
 TAIL_ROWS = 60  # sized for confluence_points()'s internal n>=50 gate (needs a
 # real ~10-bar runway past that minimum to produce a meaningful value for the
@@ -256,7 +306,8 @@ class SymbolState:
         return row
 
 
-def _add_derived_columns(enriched: pd.DataFrame) -> pd.DataFrame:
+def _add_derived_columns(enriched: pd.DataFrame,
+                         base: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Adds support/resistance (+ touch-count strength) and volume-strength
     columns that this module previously never computed at all.
 
@@ -292,6 +343,42 @@ def _add_derived_columns(enriched: pd.DataFrame) -> pd.DataFrame:
     # ~10-bar runway, so this now produces meaningful values for the most
     # recent rows instead of always reading 0.0.
     enriched["confluence"] = confluence_points(enriched)
+    return enriched
+
+
+def _add_derived_columns_windowed(enriched: pd.DataFrame,
+                                  base: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """`_add_derived_columns`, computed over a longer raw window and aligned
+    back onto `enriched`. RCA F6.
+
+    The warm path only holds TAIL_ROWS(+1) rows of state, which is too short
+    for volatility_ratio()'s rolling(50) over a still-warming ATR(20) -- the
+    result was all-NaN and the `.fillna(1.0)` inside it silently turned
+    vol_ratio into a constant 1.0 for every live bar.
+
+    Every column computed here reads only OHLCV/timestamp/volume (verified
+    across volume_ma, volume_strength, volatility_ratio,
+    price_action_strength, time_session_volatility_multiplier and
+    confluence_points -- none of them touches an incrementally-maintained
+    column), and `enriched` carries exactly the raw OHLCV for the rows it
+    holds. So the values can be computed on the longer raw window and copied
+    back positionally: the trailing `len(enriched)` rows of the two frames are
+    the same bars in the same order. The row-count contract of
+    `get_enriched()` is unchanged, and no indicator maths is touched.
+    """
+    if base is None or len(base) <= len(enriched):
+        return _add_derived_columns(enriched)
+
+    # The window must be at least as long as the frame we are going to copy
+    # back onto, or the positional alignment below has too few rows.
+    window = base.tail(max(DERIVED_WINDOW, len(enriched))).reset_index(drop=True)
+    computed = _add_derived_columns(window.copy())
+    # Align the trailing rows back onto `enriched`.
+    aligned = computed.tail(len(enriched)).reset_index(drop=True)
+    for col in ("support", "resistance", "support_strength", "resistance_strength",
+                "vol_ma", "vol_strength", "vol_ratio", "price_strength",
+                "time_vol_mult", "confluence"):
+        enriched[col] = aligned[col].to_numpy()
     return enriched
 
 
@@ -374,9 +461,10 @@ class IndicatorCache:
                     float(r.open), float(r.high), float(r.low), float(r.close),
                 )
                 row["volume"] = float(getattr(r, "volume", 0.0) or 0.0)
+                _carry_volume_source(row, raw, i)
                 rows.append(row)
             enriched = pd.DataFrame(rows)
-            enriched = _add_derived_columns(enriched)
+            enriched = _add_derived_columns_windowed(enriched, raw)
             self._state[key] = state
             self._tail[key] = enriched.iloc[:-1].tail(TAIL_ROWS).reset_index(drop=True)
             self._last_committed_ts[key] = float(raw["timestamp"].iloc[-2])
@@ -390,6 +478,7 @@ class IndicatorCache:
                 float(r.open), float(r.high), float(r.low), float(r.close),
             )
             row["volume"] = float(getattr(r, "volume", 0.0) or 0.0)
+            _carry_volume_source(row, raw, len(raw) - 2)
             tail = pd.concat([tail, pd.DataFrame([row])], ignore_index=True).tail(TAIL_ROWS).reset_index(drop=True)
             self._tail[key] = tail
             self._last_committed_ts[key] = closed_ts
@@ -401,6 +490,7 @@ class IndicatorCache:
             float(r.open), float(r.high), float(r.low), float(r.close),
         )
         live_row["volume"] = float(getattr(r, "volume", 0.0) or 0.0)
+        _carry_volume_source(live_row, raw, len(raw) - 1)
         enriched = pd.concat([tail, pd.DataFrame([live_row])], ignore_index=True)
-        enriched = _add_derived_columns(enriched)
+        enriched = _add_derived_columns_windowed(enriched, raw)
         return enriched, True

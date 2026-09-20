@@ -849,10 +849,26 @@ class PyQuotexProvider(MarketProvider):
             await asyncio.to_thread(session.close)
 
     async def connect(self) -> bool:
-        import sys
-        vendor = Path(__file__).resolve().parents[3] / "vendor" / "pyquotex"
-        if str(vendor) not in sys.path:
-            sys.path.insert(0, str(vendor))
+        # RCA F1/F2: this used to be
+        #     vendor = Path(__file__).resolve().parents[3] / "vendor" / "pyquotex"
+        #     sys.path.insert(0, str(vendor))
+        # which (a) pointed at an EMPTY directory in a fresh clone, because
+        # `vendor/pyquotex/` is untracked -- git cannot store an empty folder --
+        # and (b) resolved outside the container's build context, where this
+        # file is /app/backend/app/services/market.py. Either way the import
+        # below raised ModuleNotFoundError and every real broker connection
+        # silently died. The resolver searches the vendor tree (and honours
+        # $PYQUOTEX_VENDOR_PATH for container layouts) instead of guessing.
+        from ..pyquotex_vendor import ensure_pyquotex_on_path
+        resolved = ensure_pyquotex_on_path()
+        if resolved is None:
+            raise RuntimeError(
+                "Could not locate the vendored pyquotex library. Looked for "
+                "pyquotex/stable_api.py under $PYQUOTEX_VENDOR_PATH and every "
+                "<ancestor>/vendor/ directory. Real Quotex connectivity is "
+                "unavailable until the library is present -- see "
+                "vendor/README.md."
+            )
         from pyquotex.stable_api import Quotex  # type: ignore
         from pyquotex import config as _pyquotex_config  # type: ignore
 

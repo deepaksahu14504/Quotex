@@ -1,0 +1,15 @@
+# Development / test-only dependencies. Not needed to run the app.
+#
+#   cd backend
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt -r requirements-quotex.txt -r requirements-dev.txt
+#   python -m pytest -q
+#
+# `pgserver` bundles a self-contained PostgreSQL server. It is needed only by
+# the DB-backed tests (test_account_mode_persistence.py, test_trade_settlement.py),
+# which exercise broker_sessions -- a PostgreSQL-only table (the schema uses
+# JSONB), so SQLite cannot stand in. Those tests skip when pgserver is absent,
+# so the rest of the suite runs without it.
+pytest>=7.0
+pytest-asyncio>=0.21
+pgserver>=0.1

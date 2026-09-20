@@ -117,7 +117,10 @@ async def q_hung_asset():
 # ==================================================================== #
 async def q_stuck_send():
     print("\n=== Q5 — can one stuck send block every socket operation? ===")
-    sys.path.append(str(Path(__file__).resolve().parents[1] / "vendor" / "pyquotex"))
+    # RCA F1: resolve the vendored broker library instead of assuming
+    # vendor/pyquotex exists (it is empty in a fresh clone).
+    from app.pyquotex_vendor import ensure_pyquotex_on_path
+    ensure_pyquotex_on_path()
     from pyquotex.api import QuotexAPI
     from pyquotex.global_value import WebsocketStatus
 

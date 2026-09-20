@@ -14,7 +14,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.append(str(Path(__file__).resolve().parents[1] / "vendor" / "pyquotex"))
+# RCA F1: resolve the vendored broker library instead of assuming
+# vendor/pyquotex exists (it is empty in a fresh clone).
+from app.pyquotex_vendor import ensure_pyquotex_on_path
+ensure_pyquotex_on_path()
 
 from app.engine.task_supervisor import TaskSupervisor  # noqa: E402
 

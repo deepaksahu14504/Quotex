@@ -1,0 +1,39 @@
+# The build context is the repository root (see docker-compose.yml), so keep
+# it small and make sure nothing secret or stale gets baked into the image.
+
+# VCS / tooling
+.git
+.gitignore
+.github
+
+# Python caches and virtualenvs
+**/__pycache__
+**/*.pyc
+.venv
+backend/.venv
+backend/.pytest_cache
+backend/.mypy_cache
+backend/.ruff_cache
+
+# Node / frontend build artifacts -- the image runs the backend only; the
+# built frontend is served from frontend/dist by the backend if present.
+frontend/node_modules
+frontend/dist
+node_modules
+
+# Runtime state -- NEVER bake user data, encrypted broker sessions or logs
+# into an image layer. backend/data is bind-mounted at run time.
+backend/data
+backend/*.log
+logs
+sessions
+
+# Local env files (the image reads them via docker-compose env_file)
+.env
+.env.*
+
+# Docs and scratch material
+*.md
+!backend/README.md
+/tmp
+scratch

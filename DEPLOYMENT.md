@@ -92,9 +92,26 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
-# Only if you're using the real Quotex provider (you are):
-pip install -r requirements-quotex.txt 2>/dev/null || true
+# REQUIRED for the real Quotex provider (you are). Do NOT let this fail
+# silently: pyquotex needs bs4 / httpx / fake-useragent at import time, so
+# without it `import pyquotex.stable_api` raises ModuleNotFoundError and every
+# real broker connection dies -- while the app still starts up looking healthy.
+pip install -r requirements-quotex.txt
 ```
+
+Verify the vendored broker library is importable before going any further --
+this is the single check that catches both a missing `vendor/` directory and
+missing Python dependencies:
+
+```bash
+python -c "from app.pyquotex_vendor import ensure_pyquotex_on_path as e; \
+p = e(); assert p, 'vendored pyquotex NOT FOUND'; \
+import pyquotex.stable_api; print('pyquotex OK ->', p)"
+```
+
+It must print the vendor path it resolved (normally
+`~/app/vendor/old-pyquotex`). Resolution order and the
+`PYQUOTEX_VENDOR_PATH` override are documented in `vendor/README.md`.
 
 Configure `.env`:
 

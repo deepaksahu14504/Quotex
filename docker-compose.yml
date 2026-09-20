@@ -29,7 +29,14 @@ services:
 
   backend:
     build:
-      context: ./backend
+      # RCA F2: the context used to be ./backend, which cannot see the
+      # repo-root vendor/ directory. That made the vendored pyquotex broker
+      # library impossible to COPY into the image, so every real Quotex
+      # connection failed with ModuleNotFoundError inside the container while
+      # the systemd deployment next door worked fine. The context is now the
+      # repository root and backend/Dockerfile selects what it copies.
+      context: .
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
     depends_on:
       db:
@@ -43,7 +50,11 @@ services:
     ports:
       - "8090:8090"
     volumes:
-      - ./backend/data:/app/data   # non-DB state only now (e.g. per-user JSON persistence under engine/services)
+      # Non-DB state only (per-user JSON persistence under engine/services).
+      # The in-image path moved from /app/data to /app/backend/data because
+      # config.DATA_DIR is resolved as <dir containing the app package>/data,
+      # and the package moved from /app to /app/backend.
+      - ./backend/data:/app/backend/data
 
 volumes:
   qat_pgdata:

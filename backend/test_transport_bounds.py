@@ -161,16 +161,21 @@ class _TickClient:
 
 
 def make_provider(buf):
-    p = PyQuotexProvider.__new__(PyQuotexProvider)
+    # Use the REAL __init__ rather than `PyQuotexProvider.__new__` + a
+    # hand-maintained attribute list. The hand-rolled version silently
+    # drifted the moment the seed-plateau fix added `_seed_plateaued_at`
+    # (and `_asset_feed`, `_last_good_assets`, `_asset_refresh_lock`,
+    # `_tournament_id`): get_candles() then died with
+    #     AttributeError: 'PyQuotexProvider' object has no attribute
+    #     '_seed_plateaued_at'
+    # which is a test-harness failure, not a provider bug. __init__ performs
+    # no I/O -- it only assigns attributes -- so calling it here is free and
+    # can never drift again.
+    p = PyQuotexProvider("transport-bounds@example.invalid", "unused", True)
     p._client = _TickClient(buf)
     p._connected = True
     p._candle_cache = {}
     p._streamed = {("EURUSD", 60), ("EURUSD", 300)}
-    p._subscribing = set()
-    p._stream_tick_ts = {}
-    p._last_resync = {}
-    p._cache_lru = []
-    p.new_data_event = asyncio.Event()
     return p
 
 

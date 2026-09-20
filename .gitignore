@@ -15,6 +15,17 @@ logs/
 
 session/
 sessions/
+# RCA F3: the two rules above never matched anything real. pyquotex writes its
+# broker session cache to a directory named `pyquotex_sessions/`, and the
+# backend also drops a `session.json` next to its own code. Both contain a
+# live 40-char SSID plus `laravel_session` / `remember_web_*` cookies, and four
+# of them were committed. Ignore the actual paths.
+pyquotex_sessions/
+backend/session.json
+# Per-user runtime state: encrypted broker sessions, trade history, runtime
+# settings (which holds the Telegram bot token) and the signal queue. This is
+# live account material, not source -- it must never be committed.
+backend/data/
 cookies/
 *.cookie
 

@@ -56,6 +56,22 @@ class MarketProvider:
     async def get_payout(self, asset: str, timeframe: str) -> float: ...
     async def place_order(self, asset: str, amount: float, direction: Direction, duration: int): ...
     async def check_result(self, order_id: str): ...
+
+    async def recover_result(self, order_id: str):
+        """Resolve an order from DURABLE broker state, for restart recovery.
+
+        RCA F8: `check_result` waits on a live websocket notification. After a
+        backend restart that notification is gone for good -- the slot it
+        would have fired was in memory -- so an order that was open when the
+        process died can never be settled through the normal path. This method
+        reads whatever the broker itself still remembers instead.
+
+        Same return contract as `check_result`: a result dict, or None when
+        the broker has no record of the order (still running, or too old).
+        Providers with no durable history just return None.
+        """
+        return None
+
     async def switch_account(self, account_mode: str, tournament_id: Optional[int] = None) -> bool:
         """Switch the active trading account: 'live', 'demo', or
         'tournament' (with tournament_id). Returns True if the switch is
@@ -1844,6 +1860,59 @@ class PyQuotexProvider(MarketProvider):
         self._orders[oid] = {"asset": asset}
         open_price = info.get("openPrice") if isinstance(info, dict) else None
         return oid, open_price
+
+    async def recover_result(self, order_id: str):
+        """Settle an order from the broker's own trade history. RCA F8.
+
+        Uses pyquotex's `get_result()`, which reads `get_trader_history()` --
+        the broker's server-side record, not anything cached in this process --
+        so it still knows about trades opened before a restart.
+
+        The vendor classifies that history as `"win" if profitAmount > 0 else
+        "loss"`, which is exactly the tie/refund defect fixed in
+        `check_result` (RCA F7): a returned stake would be booked as a loss
+        and would trip `consecutive_losses` and escalate `_martingale_step`.
+        So the vendor's verdict string is ignored and the classification is
+        done here from `profitAmount` by sign, with zero meaning draw.
+        """
+        try:
+            _vendor_status, item = await asyncio.wait_for(
+                self._client.get_result(str(order_id)), CHECK_RESULT_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            log_event(
+                logger, logging.WARNING, "recover_result_timeout",
+                order_id=str(order_id), timeout_seconds=CHECK_RESULT_TIMEOUT,
+                reason="broker history did not answer in time -- trade left pending",
+            )
+            return None
+        except Exception as exc:
+            logger.debug("recover_result(%s) failed: %s", order_id, exc)
+            return None
+
+        if not isinstance(item, dict):
+            # The vendor returns (None, "OperationID Not Found.") when the
+            # order is not in the history page it fetched.
+            return None
+
+        try:
+            amount = float(item.get("profitAmount", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+
+        if amount > 0:
+            status = "win"
+        elif amount < 0:
+            status = "loss"
+        else:
+            status = "draw"
+
+        log_event(
+            logger, logging.INFO, "trade_recovered_from_history",
+            order_id=str(order_id), status=status, profit=amount,
+            reason="settled from broker trade history after a restart",
+        )
+        return {"status": status, "profit": amount, "close_price": None, "open_price": None}
 
     async def check_result(self, order_id: str):
         """Resolve one order. Returns a result dict, or None when the outcome

@@ -132,6 +132,13 @@ PROVIDER_CONNECT_TIMEOUT_SECONDS = 60.0      # ceiling for the initial/reconnect
 # gives up -- a timeout must surface as "still pending", never as a loss.
 RESULT_CHECK_TIMEOUT = 45.0
 
+# How long a trade left open by a restart stays tracked while we wait for the
+# broker to account for it (RCA F8). Past this it is marked `error` in the
+# store -- visible as unresolved -- instead of being deleted. 30 minutes is far
+# longer than any supported option duration, so a trade still unknown by then
+# is not going to resolve on its own.
+UNRECOVERABLE_TRADE_AFTER_SECONDS = 1800.0
+
 logger = logging.getLogger("orchestrator")
 
 def signal_ttl_seconds(timeframe: str, regime: Optional[str]) -> float:
@@ -219,6 +226,12 @@ class Orchestrator:
                                  tournament_supported=self.provider.supports_tournaments())
         self.signals: Dict[str, Signal] = {}
         self.active_trades: Dict[str, TradeRecord] = {}
+        # Results recovered from the broker's own trade history at startup
+        # (RCA F8), keyed by order id. `_bounded_check_result` drains this
+        # first: after a restart the websocket slot that would have delivered
+        # the outcome no longer exists, so waiting on `check_win` for these
+        # orders can only burn its timeout and report "unknown" forever.
+        self._recovered_results: Dict[str, dict] = {}
         self._last_execution_refusal: Optional[str] = None
         self.trade_engine = TradeEngine(
             self._do_execute_signal,
@@ -543,18 +556,101 @@ class Orchestrator:
         return dict(self._live_regime)
 
     # -- lifecycle ---------------------------------------------------------- #
-    def _reconcile_open_trades(self) -> None:
-        """Remove stale 'open'/'pending' trades left in storage after a restart.
-        Their outcome is unknown (the in-memory tracker is gone), so rather than
-        fabricate a result we drop them to keep history accurate."""
-        stale = [t.id for t in self.store.all() if t.status in (TradeStatus.OPEN, TradeStatus.PENDING)]
-        if stale:
+    async def _recover_open_trades(self) -> None:
+        """Re-adopt the trades that were open when the process last died.
+
+        RCA F8. This used to be `_reconcile_open_trades`, and its entire body
+        was:
+
+            stale = [t.id for t in self.store.all()
+                     if t.status in (TradeStatus.OPEN, TradeStatus.PENDING)]
             self.store.remove_many(stale)
+
+        Deleting them is not a neutral "keep history accurate" choice -- it
+        destroys the record of every position that was live across a restart,
+        wins and losses alike. Whatever the broker did with those orders never
+        reaches the risk counters, the strategy performance tracker, the
+        win-rate calibration or the trade log, so the statistics are
+        systematically skewed towards whatever happened to survive, and
+        `daily_pnl` silently forgets the money. A restart during a losing
+        streak also erased the streak, so the drawdown and
+        consecutive-loss circuit breakers could be walked around by
+        restarting.
+
+        Now: ask the broker. `provider.recover_result()` reads the broker's own
+        trade history, which is server-side and survives our restart, so most
+        of these can be settled properly. Whatever it can settle is queued in
+        `_recovered_results` and the trade is put back into `active_trades`,
+        so it flows through the ordinary `_result_loop` settlement path --
+        risk, strategy learning, balance, broadcast -- rather than a second,
+        divergent bookkeeping path.
+
+        Anything the broker does NOT recognise is kept and still tracked, not
+        deleted: the order may genuinely still be running. It is only after
+        `UNRECOVERABLE_TRADE_AFTER_SECONDS` that we stop pretending, and even
+        then the trade is marked `error` in the store -- visibly unresolved --
+        rather than removed.
+        """
+        stale = [t for t in self.store.all() if t.status in (TradeStatus.OPEN, TradeStatus.PENDING)]
+        if not stale:
+            return
+
+        now = now_ts()
+        recovered = 0
+        resumed = 0
+        abandoned = 0
+
+        for trade in stale:
+            oid = str(trade.id)
+            try:
+                result = await self.provider.recover_result(oid)
+            except Exception:
+                logger.debug("[recovery] recover_result(%s) raised", oid, exc_info=True)
+                result = None
+
+            if result:
+                self._recovered_results[oid] = result
+                self.active_trades[oid] = trade
+                recovered += 1
+                continue
+
+            # TradeRecord stamps entry time in `created_at` -- there is no
+            # `opened_at` field, and reading one with a getattr default would
+            # silently yield 0 and make EVERY unrecovered trade look ancient.
+            age = now - float(getattr(trade, "created_at", 0) or 0)
+            if age <= UNRECOVERABLE_TRADE_AFTER_SECONDS:
+                # The broker has no record yet. It may still be running, so
+                # keep tracking it -- a live websocket can still settle it.
+                self.active_trades[oid] = trade
+                resumed += 1
+            else:
+                # Old AND unknown. Stop occupying a concurrency slot, but keep
+                # the record so the gap is visible instead of silently erased.
+                trade.status = TradeStatus.ERROR
+                trade.closed_at = now
+                self.store.update(trade)
+                abandoned += 1
+
+        if recovered or resumed or abandoned:
+            log_event(
+                logger, logging.INFO, "open_trades_reconciled",
+                user_id=self.user_id,
+                found=len(stale), recovered=recovered,
+                resumed_tracking=resumed, marked_unresolved=abandoned,
+                reason="trades open across a restart were settled from broker "
+                       "history or kept for tracking -- none were deleted",
+            )
+            await hub.broadcast(self.user_id, "notice", {
+                "message": (
+                    f"Restart recovery: {recovered} trade(s) settled from broker history, "
+                    f"{resumed} still being tracked, {abandoned} marked unresolved."
+                )
+            })
 
     async def start(self) -> None:
         if self._running:
             return
-        self._reconcile_open_trades()
+        await self._recover_open_trades()
         stale_pending = self.queue_persistence.get_pending()
         if stale_pending:
             logger.warning(
@@ -3896,6 +3992,12 @@ class Orchestrator:
         Returns None when the outcome is not yet known, which the caller
         treats as "leave it pending" -- never as a loss.
         """
+        # A result recovered from the broker's history at startup wins: the
+        # websocket slot that would have delivered it is gone after a restart,
+        # so waiting on check_win() for these orders can only time out (RCA F8).
+        recovered = self._recovered_results.pop(str(oid), None)
+        if recovered is not None:
+            return recovered
         try:
             return await asyncio.wait_for(
                 self.provider.check_result(oid), RESULT_CHECK_TIMEOUT

@@ -1337,12 +1337,16 @@ class Orchestrator:
             # why the panel read "35 eligible -> 7 scanned (-28 below min
             # payout)". Reported separately so each number lands on the step
             # it actually belongs to.
+            "candidates_excluded_by_payout": max(
+                0,
+                self._asset_funnel.get("open_count", 0)
+                - self._asset_funnel.get("open_and_payout_qualified_count", 0),
+            ),
             "instruments_excluded_by_payout": max(
                 0,
                 self._asset_funnel.get("open_count", 0)
                 - self._asset_funnel.get("open_and_payout_qualified_count", 0),
             ),
-            "candidates_excluded_by_payout": 0,
             "candidates_excluded_by_cap": self._asset_funnel.get("candidates_excluded_by_cap", 0),
             "next_scan_due_at": (
                 (h.get("last_scan_completed_at") or 0) + SCAN_INTERVAL_BACKSTOP

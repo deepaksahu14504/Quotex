@@ -632,7 +632,7 @@ class PyQuotexProvider(MarketProvider):
         # were built almost entirely from the 45s resync and the history
         # seed with essentially no live-tick contribution -- and mtf_mode
         # "hard" gates entries on that HTF bias.
-        self._stream_tick_ts: Dict[Tuple[str, int], float] = {}
+        self._stream_tick_ts: Dict[Tuple[str, int], Tuple[float, int]] = {}
         self._last_resync: Dict[str, float] = {}   # key -> last time we did a real history fetch
         self._tick_watcher_task: Optional[asyncio.Task] = None
         self._tournament_id: Optional[int] = None  # currently-active tournament, if any -- None means live/demo
@@ -987,43 +987,63 @@ class PyQuotexProvider(MarketProvider):
     def _new_ticks(self, asset: str, period: int, ticks: List[dict]) -> List[dict]:
         """Return the ticks not yet folded in for `asset`.
 
-        Cursor is the last folded tick's timestamp for THIS (asset,
-        period), NOT a list index or length -- the broker's buffer is a
-        bounded 1000-entry list that evicts from the left, so any
-        position-based cursor becomes wrong the moment it saturates, and
-        a cursor shared across timeframes starves whichever timeframe
-        reads second.
+        Cursor is a (last_ts, last_idx_at_ts) pair for THIS (asset, period),
+        NOT a list index or length -- the broker's buffer is a bounded
+        1000-entry list that evicts from the left, so any position-based
+        cursor becomes wrong the moment it saturates, and a cursor shared
+        across timeframes starves whichever timeframe reads second.
 
-        The comparison is `>=`, deliberately. Several ticks can share one
-        timestamp, and re-folding the boundary tick is harmless because
-        the fold is idempotent: `high`/`low` are max/min, and `close` is
-        last-write-wins with the ticks applied in list order. `>` would
-        silently drop same-second ticks; `>=` cannot lose one.
-
-        Work is bounded: everything strictly older than the cursor is
-        skipped, so a normal call re-examines only the one or two ticks
-        sharing the boundary second.
+        Strict `>` on the timestamp plus a position counter WITHIN the
+        boundary timestamp means:
+          * same-second ticks that arrive AFTER the previous fold are
+            still picked up (no silent drop -- same-timestamp ticks are
+            real and move high/low/close);
+          * but the exact ticks we already folded are NOT refolded on the
+            next call, which would double-count the tick-count volume
+            proxy and make every candle's volume grow without bound.
+        `>=` alone was the bug: it was idempotent for OHLC (max/min/last-
+        write-wins) but NOT for additive volume, which is exactly what
+        test_refolding_the_boundary_tick_is_idempotent caught.
         """
-        last_ts = self._stream_tick_ts.get((asset, period))
-        if last_ts is None:
+        last = self._stream_tick_ts.get((asset, period))
+        if last is None:
             return ticks
+        last_ts, last_idx = last
         out = []
-        for t in ticks:
+        for i, t in enumerate(ticks):
             try:
-                if float(t["time"]) >= last_ts:
+                tt = float(t["time"])
+                if tt > last_ts or (tt == last_ts and i > last_idx):
                     out.append(t)
             except (KeyError, TypeError, ValueError):
                 continue
         return out
 
-    def _advance_tick_cursor(self, asset: str, period: int, consumed: List[dict]) -> None:
-        """Move the cursor to the newest tick actually folded in."""
-        for t in reversed(consumed):
+    def _advance_tick_cursor(self, asset: str, period: int, ticks: List[dict],
+                             consumed: List[dict]) -> None:
+        """Move the cursor past the newest tick actually folded in."""
+        if not consumed:
+            return
+        # Position within the FULL ticks snapshot (consumed is a suffix).
+        # Because consumed is built by iterating ticks in order, the last
+        # element of consumed sits at index len(ticks) - (len(consumed) -
+        # offset_from_end). Easier: scan backwards from the end for the
+        # same dict identity or the same timestamp+price combo.
+        last_t = consumed[-1]
+        try:
+            last_ts = float(last_t["time"])
+        except (KeyError, TypeError, ValueError):
+            return
+        last_idx = -1
+        for i in range(len(ticks) - 1, -1, -1):
             try:
-                self._stream_tick_ts[(asset, period)] = float(t["time"])
-                return
+                if float(ticks[i]["time"]) == last_ts:
+                    last_idx = i
+                    break
             except (KeyError, TypeError, ValueError):
                 continue
+        if last_idx >= 0:
+            self._stream_tick_ts[(asset, period)] = (last_ts, last_idx)
 
     async def _tick_watcher(self) -> None:
         """pyquotex already streams ticks over its own websocket into
@@ -1665,7 +1685,7 @@ class PyQuotexProvider(MarketProvider):
                     except Exception:
                         row["volume"] = 1.0
                 folded.append(t)
-            self._advance_tick_cursor(asset, period, folded)
+            self._advance_tick_cursor(asset, period, ticks, folded)
 
         if len(cache) > 800:  # cap memory
             for k in sorted(cache)[:len(cache) - 800]:

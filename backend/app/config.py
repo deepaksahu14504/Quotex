@@ -680,6 +680,35 @@ class MarketInitSettings(BaseModel):
                                               # 0 restores the old fail-on-first-gap behaviour.
 
 
+class MarketDataSettings(BaseModel):
+    """Realtime market-data feature layer.
+
+    Everything here is *additive*: it configures features computed on top of the
+    existing OHLC engine. Disabling sentiment (`sentiment_enabled = false`) makes
+    the signal path byte-for-byte what it was before this layer existed.
+
+    Backward compatible by construction: a `runtime_settings.json` written before
+    this class existed has no `market_data` key, and pydantic fills these defaults.
+    """
+
+    # ── price-action / microstructure features ─────────────────────────────
+    features_enabled: bool = True             # compute the OHLC price-action columns
+    tick_features_enabled: bool = True        # compute tick-activity features
+    max_ticks_per_bar: int = 512              # bound per-bar tick memory (activity saturates)
+    tick_baseline_bars: int = 40              # closed bars used as the activity baseline
+
+    # ── trader sentiment (optional, bounded, never a signal source) ────────
+    sentiment_enabled: bool = False           # OFF by default: opt-in only
+    sentiment_max_age_seconds: float = 120.0  # older than this => ignored, not penalised
+    sentiment_min_strength: float = 0.10      # |bias| below this => ignored (10 percentage pts)
+    sentiment_max_confidence_adjustment: float = 4.0   # hard cap, in confidence points (3-5)
+    sentiment_disagreement_penalty: Optional[float] = None  # default: half the cap
+
+    # ── data quality ───────────────────────────────────────────────────────
+    price_max_age_seconds: float = 90.0       # last tick older than this => stale_price
+    min_bars_for_features: int = 20           # below this, features stay neutral
+
+
 class RuntimeSettings(BaseModel):
     # Active market/execution provider. None => use env MARKET_PROVIDER.
     provider: Optional[Literal["paper", "pyquotex"]] = None
@@ -689,6 +718,7 @@ class RuntimeSettings(BaseModel):
     ux: UXSettings = Field(default_factory=UXSettings)
     telegram: TelegramSettings = Field(default_factory=TelegramSettings)
     market_init: MarketInitSettings = Field(default_factory=MarketInitSettings)
+    market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
 
     @classmethod
     def load(cls, user_id: Optional[str] = None) -> "RuntimeSettings":

@@ -139,6 +139,17 @@ def _enrich(df: pd.DataFrame) -> pd.DataFrame:
     # IMPROVEMENT 5: Time-of-day volatility
     df["time_vol_mult"] = ta.time_session_volatility_multiplier(df)
     
+    # Price-action feature layer (RCA P3). Mirrors incremental.py's
+    # `_add_derived_columns` so live and backtest see the SAME columns — the
+    # parity gap this module's own history keeps finding. Additive only: no
+    # strategy reads these yet, and `add_price_action_features` refuses to
+    # overwrite an existing column, so `atr` above is untouched.
+    try:
+        from app.engine.market_features import add_price_action_features
+        df = add_price_action_features(df)
+    except Exception:
+        pass
+    
     return df
 
 

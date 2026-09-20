@@ -34,6 +34,7 @@ from .indicators import (
     volatility_ratio, price_action_strength, confluence_points,
     time_session_volatility_multiplier, _VOLUME_SOURCE_COLUMN,
 )
+from .market_features import PRICE_ACTION_FEATURES, QualityReport, validate_ohlc
 
 def _carry_volume_source(row: dict, raw, i: int) -> dict:
     """Copy the `_volume_source` tag from the raw frame onto a hand-built row.
@@ -343,6 +344,23 @@ def _add_derived_columns(enriched: pd.DataFrame,
     # ~10-bar runway, so this now produces meaningful values for the most
     # recent rows instead of always reading 0.0.
     enriched["confluence"] = confluence_points(enriched)
+    # Price-action feature layer (RCA P3). Purely additive: every one of these
+    # columns is derived from OHLC alone, so they are meaningful on the
+    # pyquotex path where `volume` is 0/synthetic. `add_price_action_features`
+    # never overwrites a column that already exists, so `atr` (computed by
+    # SymbolState.step) and anything a strategy set earlier are preserved.
+    try:
+        from app.engine.market_features import add_price_action_features
+        _qual = QualityReport()
+        enriched = add_price_action_features(validate_ohlc(enriched, _qual))
+        if not _qual.ok:
+            enriched["_data_quality"] = _qual.value
+    except Exception:
+        # A feature-layer failure must never take the signal engine down. The
+        # engine has run without these columns since it was written, so
+        # degrading to "columns absent" is exactly the old, known-good
+        # behaviour.
+        pass
     return enriched
 
 
@@ -375,11 +393,28 @@ def _add_derived_columns_windowed(enriched: pd.DataFrame,
     computed = _add_derived_columns(window.copy())
     # Align the trailing rows back onto `enriched`.
     aligned = computed.tail(len(enriched)).reset_index(drop=True)
-    for col in ("support", "resistance", "support_strength", "resistance_strength",
-                "vol_ma", "vol_strength", "vol_ratio", "price_strength",
-                "time_vol_mult", "confluence"):
+    for col in _WINDOWED_COPY_COLUMNS:
+        if col not in aligned.columns:
+            continue
         enriched[col] = aligned[col].to_numpy()
     return enriched
+
+
+# Columns recomputed over the long window and copied back positionally.
+#
+# This list is load-bearing. `enriched` is the *persistent* warm tail held by
+# SymbolState, so a column that `_add_derived_columns()` writes but this list
+# omits is NOT missing — it silently keeps the values written during the cold
+# rebuild, misaligned against every later bar. That is how the price-action
+# features first shipped as all-NaN on the warm path. Anything
+# `_add_derived_columns()` adds must be listed here; incrementally-maintained
+# columns (ema*, rsi, macd*, atr, stoch*, adx, ...) must NOT be, because they
+# are not present in `computed` at all.
+_WINDOWED_COPY_COLUMNS: Tuple[str, ...] = (
+    "support", "resistance", "support_strength", "resistance_strength",
+    "vol_ma", "vol_strength", "vol_ratio", "price_strength",
+    "time_vol_mult", "confluence", "_data_quality",
+) + tuple(PRICE_ACTION_FEATURES)
 
 
 class IndicatorCache:

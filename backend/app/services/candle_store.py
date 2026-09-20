@@ -36,7 +36,7 @@ class CandleStore:
             clauses.append("ts <= :to_ts")
             params["to_ts"] = to_ts
         sql = (
-            f"SELECT ts, open, high, low, close, volume FROM candles "
+            f"SELECT ts, open, high, low, close, volume, volume_source FROM candles "
             f"WHERE {' AND '.join(clauses)} ORDER BY ts ASC"
         )
         if limit:
@@ -46,12 +46,14 @@ class CandleStore:
         return [
             Candle(timestamp=r["ts"], open=r["open"], high=r["high"],
                    low=r["low"], close=r["close"], volume=r["volume"] or 0.0,
-                   # Cached candles pre-dating the volume_source column
-                   # default to "real" (Binance/public path is the older
-                   # one); for pyquotex the in-memory cache always wins
-                   # over PG anyway, and new rows are upserted with the
-                   # tag set correctly below.
-                   volume_source="real")
+                   # RCA C.1: read the tag back. NULL means the row was
+                   # written before migration 0002 existed and has no
+                   # recorded provenance -- "real" preserves the old
+                   # behaviour for those pre-existing public-provider
+                   # rows. Rows written from 0002 onwards carry their
+                   # true tag, so a pyquotex tick-count can no longer be
+                   # laundered into "real" volume on the way through PG.
+                   volume_source=r["volume_source"] or "real")
             for r in rows
         ]
 
@@ -59,7 +61,7 @@ class CandleStore:
         with tx() as conn:
             rows = conn.execute(
                 text(
-                    """SELECT ts, open, high, low, close, volume FROM candles
+                    """SELECT ts, open, high, low, close, volume, volume_source FROM candles
                        WHERE user_id = :user_id AND asset = :asset AND timeframe = :timeframe
                        ORDER BY ts DESC LIMIT :count"""
                 ),
@@ -69,7 +71,10 @@ class CandleStore:
         return [
             Candle(timestamp=r["ts"], open=r["open"], high=r["high"],
                    low=r["low"], close=r["close"], volume=r["volume"] or 0.0,
-                   volume_source="real")
+                   # RCA C.1: NULL (pre-0002 row, no recorded provenance)
+                   # keeps the old "real" default; anything written since
+                   # carries its true tag.
+                   volume_source=r["volume_source"] or "real")
             for r in rows
         ]
 
@@ -79,13 +84,14 @@ class CandleStore:
         as one batched statement (executemany-equivalent) instead of one
         round trip per row.
 
-        Note: `volume_source` is carried on the Candle Pydantic model but
-        intentionally NOT written to the `candles` SQL table -- adding a
-        column would force a migration for every deployed user, and the
-        in-memory provider cache always serves fresh pyquotex data before
-        this PG cache is consulted anyway. PG-stored candles default to
-        volume_source="real" on read (safe default for public-provider
-        history; pyquotex live path bypasses PG).
+        RCA C.1: `volume_source` IS persisted (migration 0002). It used to be
+        dropped here with a note claiming the pyquotex live path bypasses PG;
+        that claim does not hold. `orchestrator._run_scan` upserts every scan
+        cycle, and `orchestrator.py` / `validation_service.fetch_or_load` read
+        the rows back through `get_latest_n`, which preferred the cache over
+        the network. Every such row came back tagged "real" no matter what the
+        provider said, re-enabling volume mathematics on tick counts -- exactly
+        what `indicators._has_real_volume()`'s own docstring exists to prevent.
         """
         if not candles:
             return 0
@@ -94,6 +100,7 @@ class CandleStore:
                 "user_id": self.user_id, "asset": asset, "timeframe": timeframe,
                 "ts": c.timestamp, "open": c.open, "high": c.high, "low": c.low,
                 "close": c.close, "volume": c.volume,
+                "volume_source": c.volume_source,
             }
             for c in candles
         ]
@@ -101,11 +108,12 @@ class CandleStore:
             conn.execute(
                 text(
                     """
-                    INSERT INTO candles (user_id, asset, timeframe, ts, open, high, low, close, volume)
-                    VALUES (:user_id, :asset, :timeframe, :ts, :open, :high, :low, :close, :volume)
+                    INSERT INTO candles (user_id, asset, timeframe, ts, open, high, low, close, volume, volume_source)
+                    VALUES (:user_id, :asset, :timeframe, :ts, :open, :high, :low, :close, :volume, :volume_source)
                     ON CONFLICT (user_id, asset, timeframe, ts) DO UPDATE SET
                         open = excluded.open, high = excluded.high, low = excluded.low,
-                        close = excluded.close, volume = excluded.volume
+                        close = excluded.close, volume = excluded.volume,
+                        volume_source = excluded.volume_source
                     """
                 ),
                 rows,

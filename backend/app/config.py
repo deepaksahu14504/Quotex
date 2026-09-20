@@ -672,6 +672,12 @@ class MarketInitSettings(BaseModel):
                                               # READY and is then rejected on every evaluation for being
                                               # short -- warm-up would certify data the scanner refuses.
     gap_multiplier: float = 1.5               # same convention as the admin Candle Dashboard's gap detection
+    gap_tolerance: int = 2                    # RCA F12: how many over-long gaps one history pull may contain
+                                              # before the asset is rejected. Was effectively 0 -- the first
+                                              # gap failed the whole pull even when 119 of 120 bars were
+                                              # perfectly good, and pyquotex never pads the holes it leaves.
+                                              # Duplicate / non-increasing timestamps are still a hard reject.
+                                              # 0 restores the old fail-on-first-gap behaviour.
 
 
 class RuntimeSettings(BaseModel):

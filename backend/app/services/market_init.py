@@ -122,23 +122,71 @@ class AssetInitRecord:
         }
 
 
-def _validate_candles(candles: List[Candle], timeframe: str, gap_multiplier: float) -> Tuple[bool, str]:
+def _validate_candles(candles: List[Candle], timeframe: str, gap_multiplier: float,
+                      gap_tolerance: int = 0) -> Tuple[bool, str]:
     """Same gap-detection convention as the admin Candle Dashboard: a gap
     bigger than `gap_multiplier`x the expected bar interval counts as a
-    missing bar. Also rejects non-increasing/duplicate timestamps."""
+    missing bar. Also rejects non-increasing/duplicate timestamps.
+
+    RCA F12: a gap over the threshold used to fail the ENTIRE pull on the
+    first occurrence. That is far too strict for this broker -- pyquotex
+    serves history in chunks and never pads the holes a dropped chunk leaves,
+    so a single lost chunk meant 119 of 120 perfectly good bars were thrown
+    away, the asset went FAILED, and `_recovery_loop` re-attempted it every
+    `recovery_interval_seconds` (60s) for as long as the hole stayed in the
+    served window. `gap_tolerance` bounds how many such holes one pull may
+    contain before it is genuinely unusable; 0 restores the old behaviour.
+
+    Duplicate and non-increasing timestamps stay a HARD reject regardless of
+    tolerance: those are not missing data, they are corrupt data, and no
+    indicator downstream can be trusted on them.
+    """
     if not candles:
         return False, "no candles returned"
     interval = TIMEFRAMES.get(timeframe, 60)
     prev_ts: Optional[float] = None
+    gaps = 0
+    worst_gap = 0.0
     for c in sorted(candles, key=lambda c: c.timestamp):
         if prev_ts is not None:
             delta = c.timestamp - prev_ts
             if delta <= 0:
                 return False, f"non-increasing/duplicate timestamp at {c.timestamp}"
             if delta > interval * gap_multiplier:
-                return False, f"gap of {delta:.0f}s exceeds {gap_multiplier}x expected interval ({interval}s)"
+                gaps += 1
+                worst_gap = max(worst_gap, delta)
         prev_ts = c.timestamp
+    if gaps > max(0, int(gap_tolerance)):
+        return False, (
+            f"{gaps} gap(s) exceed {gap_multiplier}x expected interval ({interval}s), "
+            f"largest {worst_gap:.0f}s -- tolerance is {max(0, int(gap_tolerance))}"
+        )
     return True, ""
+
+
+def effective_min_bars(configured: int, observed: int,
+                       absolute_floor: int = 55) -> int:
+    """The bar count an asset should actually be certified against. RCA F11.
+
+    `trading.min_candles_for_signal` defaults to 120, which is exactly this
+    broker's history ceiling -- the loader in config.py even clamps anything
+    higher back to 120 with the comment "which no asset can reach". So the
+    READY gate sat precisely on the edge of what the data source can serve:
+    an asset returning 119 bars never became READY, and `_candidate_assets()`
+    filters READY-only, so the scan reported SCAN_CYCLE_NO_CANDIDATES forever
+    with no error to explain it.
+
+    This does NOT lower a quality bar on a whim. It only relaxes the gate to
+    what the broker demonstrably served, and never below the absolute floor
+    at which the indicator maths stops returning NaN. If the broker serves
+    enough, the configured value is used unchanged.
+    """
+    configured = int(configured)
+    observed = int(observed)
+    floor = int(absolute_floor)
+    if observed >= configured:
+        return configured
+    return max(floor, min(configured, observed))
 
 
 def _top_reasons(reasons: List[str], limit: int = 3) -> List[str]:
@@ -512,7 +560,10 @@ class MarketInitManager:
                 rec.expected_candle_count = settings.history_count
                 rec.last_history_timestamp = max((c.timestamp for c in candles), default=None)
 
-                valid, reason = _validate_candles(candles, timeframe, settings.gap_multiplier)
+                valid, reason = _validate_candles(
+                    candles, timeframe, settings.gap_multiplier,
+                    gap_tolerance=int(getattr(settings, "gap_tolerance", 0)),
+                )
                 if not valid:
                     log_event(logger, logging.WARNING, "HistoryValidationFailed", user_id=self.user_id,
                               asset=symbol, attempt=attempt, worker_id=worker_id,
@@ -532,6 +583,26 @@ class MarketInitManager:
                 min_bars = max(55, int(self._get_min_bars()))
                 _edf, warm = self._indicators.get_enriched(
                     f"{symbol}|{timeframe}", candles, min_bars=min_bars)
+                if not warm:
+                    # RCA F11: the configured gate sits exactly on the broker's
+                    # history ceiling, so an asset serving one bar less never
+                    # became READY and _candidate_assets() -- READY-only --
+                    # reported SCAN_CYCLE_NO_CANDIDATES forever. Retry against
+                    # what the broker actually served, never below the
+                    # absolute floor at which the indicator maths works.
+                    relaxed = effective_min_bars(min_bars, len(candles))
+                    if relaxed < min_bars:
+                        _edf, warm = self._indicators.get_enriched(
+                            f"{symbol}|{timeframe}", candles, min_bars=relaxed)
+                        if warm:
+                            log_event(
+                                logger, logging.WARNING, "HistoryGateRelaxed",
+                                user_id=self.user_id, asset=symbol,
+                                candle_count=len(candles),
+                                configured_min_bars=min_bars, effective_min_bars=relaxed,
+                                reason="broker served less history than the configured "
+                                       "minimum -- certified against the observed depth",
+                            )
                 rec.warm = bool(warm)
                 if not warm:
                     log_event(logger, logging.WARNING, "HistoryValidationFailed", user_id=self.user_id,

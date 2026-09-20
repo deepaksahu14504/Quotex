@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
+import { formatIndicatorValue } from "../format";
 import { useStore } from "../store";
 import type { AssetPipelineSnapshot, DriftStatus, PipelineStageMetric, PipelineTraceDetail, PipelineTraceSummary, RejectionReport } from "../types";
 import { GlassCard, Pill, SectionTitle } from "./ui";
@@ -132,7 +133,7 @@ function AssetPipelineCard({ snap }: { snap: AssetPipelineSnapshot }) {
               <div className="mx-3 mb-3 flex flex-wrap gap-1.5">
                 {Object.entries(snap.indicators).map(([k, v]) => (
                   <span key={k} className="nums rounded-md bg-white/5 px-2 py-1 text-[10.5px] text-white/70">
-                    {k} <span className="text-white/95">{typeof v === "number" ? v.toFixed(2) : v}</span>
+                    {k} <span className="text-white/95">{typeof v === "number" ? formatIndicatorValue(k, v) : v}</span>
                   </span>
                 ))}
               </div>

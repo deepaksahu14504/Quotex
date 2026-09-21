@@ -789,7 +789,7 @@ async def test_collect_market_features_is_actually_wired(orch):
     )
     edf = strategies._enrich(candles_to_df(make_candles(200)))
 
-    feats, adj = await orch._collect_market_features(
+    feats, adj, _ev = await orch._collect_market_features(
         "EURUSD", "1m", edf, direction_value="CALL",
     )
     assert orch.provider.sentiment_calls == 0, (
@@ -805,7 +805,7 @@ async def test_collect_market_features_is_actually_wired(orch):
     # Now enable it: same provider, same data, bounded positive nudge.
     orch.runtime.market_data.sentiment_enabled = True
     orch._realtime.reset()
-    feats2, adj2 = await orch._collect_market_features(
+    feats2, adj2, _ev2 = await orch._collect_market_features(
         "EURUSD", "1m", edf, direction_value="CALL",
     )
     assert orch.provider.sentiment_calls == 1, "enabling sentiment must reach the provider"
@@ -822,7 +822,7 @@ async def test_collect_market_features_survives_a_broken_sentiment_stream(orch):
     orch.runtime.market_data.sentiment_enabled = True
     edf = strategies._enrich(candles_to_df(make_candles(200)))
 
-    feats, adj = await orch._collect_market_features(
+    feats, adj, _ev = await orch._collect_market_features(
         "EURUSD", "1m", edf, direction_value="PUT",
     )
     assert adj.adjustment == 0.0
@@ -842,7 +842,7 @@ async def test_collect_market_features_handles_a_provider_without_sentiment(orch
     orch.provider = _LegacyProvider()
     orch.runtime.market_data.sentiment_enabled = True
     edf = strategies._enrich(candles_to_df(make_candles(200)))
-    feats, adj = await orch._collect_market_features(
+    feats, adj, _ev = await orch._collect_market_features(
         "EURUSD", "1m", edf, direction_value="CALL",
     )
     assert adj.adjustment == 0.0

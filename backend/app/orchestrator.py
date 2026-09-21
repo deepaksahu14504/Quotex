@@ -37,7 +37,21 @@ from .engine.market_features import (
     SentimentAdjustment,
     sentiment_confidence_adjustment,
 )
+from .engine.market_evidence import (
+    EvidenceConfig,
+    MarketEvidence,
+    evaluate_market_evidence,
+)
 from .services.realtime_state import RealtimeStateManager
+
+# Price-action columns the Market Evidence layer reads off the evaluated row.
+# Kept explicit so a column that disappears from the indicator frame degrades to
+# "feature absent" rather than raising inside the scan loop.
+EVIDENCE_ROW_FIELDS = (
+    "close_location_value", "price_position_in_range", "atr_normalized_momentum",
+    "bullish_rejection", "bearish_rejection", "breakout_distance",
+    "breakdown_distance", "support_distance", "resistance_distance",
+)
 from .engine.latency import LatencyTracker
 from .engine.precision_gate import evaluate_precision
 from .engine.queue_persistence import QueuePersistence
@@ -2317,7 +2331,56 @@ class Orchestrator:
             )
         except Exception:
             adjustment = SentimentAdjustment(0.0, False, "error")
-        return features, adjustment
+        return features, adjustment, self._evaluate_market_evidence(features, direction_value)
+
+    def _evaluate_market_evidence(
+        self,
+        features: Optional["MarketFeatures"],
+        direction_value: Optional[str],
+    ) -> "MarketEvidence":
+        """Bounded Market Evidence Score for an already-chosen direction.
+
+        Total by construction: any failure returns a neutral 0.0 adjustment, so
+        this layer can never be the reason a signal fails to evaluate. It reads
+        only the already-collected bundle — no provider call, no new data.
+
+        It never selects or reverses a direction (it returns a number), never
+        counts strategy votes, and never touches calibration, the effective
+        threshold, the precision gate or any risk control.
+        """
+        cfg = EvidenceConfig.from_settings(getattr(self.runtime, "market_data", None))
+        if features is None:
+            ev = MarketEvidence()
+            ev.verdict, ev.reason, ev.data_quality = "insufficient_data", "no_features", "no_features"
+            return ev
+
+        row: Dict[str, Any] = {}
+        try:
+            ind = features.indicators
+            if ind is not None and len(ind) > 0:
+                # Closed bar: the same row strategies evaluated. The forming bar
+                # is context only, so intrabar repainting cannot leak in here.
+                row = {k: ind.iloc[-1].get(k) for k in EVIDENCE_ROW_FIELDS if k in ind.columns}
+        except Exception:
+            row = {}
+
+        tick = features.tick
+        try:
+            return evaluate_market_evidence(
+                direction_value=direction_value,
+                row=row,
+                tick_direction_balance=float(tick.tick_direction_balance),
+                activity_intensity=float(tick.activity_intensity),
+                intrabar_momentum=float(tick.intrabar_momentum),
+                intrabar_price_change=float(tick.intrabar_price_change),
+                intrabar_range=float(tick.intrabar_range),
+                tick_count=int(tick.tick_count),
+                cfg=cfg,
+            )
+        except Exception:
+            ev = MarketEvidence()
+            ev.verdict, ev.reason, ev.data_quality = "insufficient_data", "error", "error"
+            return ev
 
     @staticmethod
     def _market_features_log_fields(
@@ -2326,13 +2389,27 @@ class Orchestrator:
         base_confidence: Optional[float] = None,
         final_confidence: Optional[float] = None,
         effective_threshold: Optional[float] = None,
+        market_ev: Optional["MarketEvidence"] = None,
+        raw_strategy_confidence: Optional[float] = None,
+        regime_adjustment: Optional[float] = None,
+        final_before_calibration: Optional[float] = None,
+        agreeing_strategies: Optional[list] = None,
+        opposing_strategies: Optional[list] = None,
+        rejection_reason: Optional[str] = None,
     ) -> dict:
         """Structured observability fields for the realtime feature layer.
 
-        Carries asset / timeframe / candle ts / price / tick_activity /
-        sentiment buy-sell-bias-stale / data_quality / base_confidence /
-        sentiment_adjustment / final_confidence / effective_threshold so a
-        signal can be audited end to end from one log line.
+        Carries the full confidence attribution chain so any signal can be
+        audited end to end from one log line:
+
+            raw_strategy_confidence → regime_adjustment
+              → market_evidence_adjustment → final_before_calibration
+              → calibrated_confidence vs effective_threshold
+              → agreeing/opposing strategies → rejection_reason
+
+        plus the evidence inputs behind the adjustment (activity_score,
+        tick_direction_balance, intrabar_momentum, price_action_score) and the
+        feature bundle's own data_quality.
 
         Credentials, cookies, session paths and tokens are never included: the
         field list is explicit and built only from feature values.
@@ -2348,12 +2425,30 @@ class Orchestrator:
                 out.update(sentiment_adj.as_dict())
             except Exception:
                 pass
+        if market_ev is not None:
+            try:
+                out.update(market_ev.as_dict())
+            except Exception:
+                pass
+        if raw_strategy_confidence is not None:
+            out["raw_strategy_confidence"] = raw_strategy_confidence
+        if regime_adjustment is not None:
+            out["regime_adjustment"] = regime_adjustment
         if base_confidence is not None:
             out["base_confidence"] = base_confidence
+        if final_before_calibration is not None:
+            out["final_before_calibration"] = final_before_calibration
         if final_confidence is not None:
+            out["calibrated_confidence"] = final_confidence
             out["final_confidence"] = final_confidence
         if effective_threshold is not None:
             out["effective_threshold"] = effective_threshold
+        if agreeing_strategies is not None:
+            out["agreeing_strategies"] = list(agreeing_strategies)
+        if opposing_strategies is not None:
+            out["opposing_strategies"] = list(opposing_strategies)
+        if rejection_reason is not None:
+            out["rejection_reason"] = rejection_reason
         return out
 
     def _effective_confidence_threshold(self, payout_pct: float) -> float:
@@ -3313,16 +3408,28 @@ class Orchestrator:
         # the direction. With sentiment disabled (default) this is exactly 0.0.
         base_confidence = adjusted_confidence
         try:
-            features, sentiment_adj = await self._collect_market_features(
+            features, sentiment_adj, market_ev = await self._collect_market_features(
                 asset.symbol, tf, edf_eval, direction_value=res.direction.value,
             )
         except Exception:
             features, sentiment_adj = None, SentimentAdjustment(0.0, False, "error")
+            market_ev = MarketEvidence()
+            market_ev.verdict = market_ev.reason = market_ev.data_quality = "error"
         if sentiment_adj.adjustment:
             # `adjusted_confidence` is what Signal.raw_confidence is built from
             # below, so the nudge is visible in the record without touching the
             # Signal construction or the threshold gate.
             adjusted_confidence = max(0, min(100, adjusted_confidence + sentiment_adj.adjustment))
+
+        # ── Market Evidence Score ───────────────────────────────────────────
+        # Independent confirmation from tick ACTIVITY and OHLC price action.
+        # Lands here — after regime/MTF, before calibration — so the calibrator
+        # still sees one combined number and every downstream gate is
+        # untouched. Bounded by config, never direction-selecting, and exactly
+        # 0.0 when the evidence is weak, missing, or the layer is disabled.
+        pre_evidence_confidence = adjusted_confidence
+        if market_ev.adjustment:
+            adjusted_confidence = max(0, min(100, adjusted_confidence + market_ev.adjustment))
 
         calibrated_confidence = self.calibrator.calibrate(adjusted_confidence, regime=res.regime) if getattr(self.runtime.trading, "calibration_enabled", True) else adjusted_confidence
         if live_confidence_model_prediction is not None:
@@ -3332,6 +3439,31 @@ class Orchestrator:
         effective_threshold = self._effective_confidence_threshold(float(getattr(asset, "payout", 0) or 0))
         if regime_transition_result is not None:
             effective_threshold += regime_transition_result.recommended_threshold_adjustment
+
+        # Full confidence attribution, built once so the REJECTED path and the
+        # signal_generated path log identical fields. Rule 8 asks for this on
+        # every evaluated signal, and a rejection is exactly the case worth
+        # auditing. Built defensively: attribution must never be the reason an
+        # evaluation fails.
+        try:
+            _opposing = [n for n, d in res.votes.items()
+                         if d != res.direction.value and d in ("call", "put")]
+        except Exception:
+            _opposing = []
+        try:
+            attribution = self._market_features_log_fields(
+                features, sentiment_adj, base_confidence,
+                calibrated_confidence, effective_threshold,
+                market_ev=market_ev,
+                raw_strategy_confidence=float(res.confidence),
+                regime_adjustment=float(regime_adj),
+                final_before_calibration=float(adjusted_confidence),
+                agreeing_strategies=contributing,
+                opposing_strategies=_opposing,
+            )
+        except Exception:
+            attribution = {}
+
         if calibrated_confidence < effective_threshold:
             if decision is not None:
                 decision.final_decision = "rejected"
@@ -3341,6 +3473,15 @@ class Orchestrator:
             self._pipeline_snapshot(asset.symbol, tf, stage="rejected",
                                      stage_reason=f"confidence {calibrated_confidence} < threshold {effective_threshold}",
                                      regime=res.regime)
+            log_event(
+                logger, logging.INFO, "signal_rejected_confidence",
+                asset=asset.symbol, timeframe=tf,
+                direction=res.direction.value if res.direction else None,
+                regime=res.regime,
+                rejection_reason=(decision.rejection_reason if decision is not None
+                                  else f"confidence {calibrated_confidence} < threshold {effective_threshold}"),
+                **attribution,
+            )
             return asset.symbol, None, res.regime, latency_key
 
         pg = None
@@ -3413,8 +3554,7 @@ class Orchestrator:
             confidence=sig.confidence, raw_confidence=sig.raw_confidence, regime=sig.regime,
             strategies=list(sig.strategy_votes.keys()), payout=sig.payout, is_otc=sig.is_otc,
             reason="cleared_evaluate_gate_and_confidence_threshold",
-            **self._market_features_log_fields(features, sentiment_adj, base_confidence,
-                                               calibrated_confidence, effective_threshold),
+            **attribution,
         )
         # Observability: start this signal's pipeline trace and record it in
         # production metrics. Earlier stages (data fetch, indicator calc)

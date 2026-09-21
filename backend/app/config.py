@@ -708,6 +708,27 @@ class MarketDataSettings(BaseModel):
     price_max_age_seconds: float = 90.0       # last tick older than this => stale_price
     min_bars_for_features: int = 20           # below this, features stay neutral
 
+    # ── Market Evidence Score (bounded, independent confirmation) ───────────
+    # A separate, additive confidence nudge derived from tick ACTIVITY and OHLC
+    # price action. It never selects or reverses a direction, never bypasses
+    # calibration / the effective-threshold gate / the precision gate, and uses
+    # no volume of any kind -- PyQuotex publishes none.
+    market_evidence_enabled: bool = True
+    market_evidence_max_adjustment: float = 5.0     # hard cap in confidence points
+    market_evidence_disagreement_penalty: float = 3.0
+    # Activity component
+    market_evidence_activity_confirmation_threshold: float = 0.25
+    market_evidence_min_ticks_for_activity: int = 8       # minimum tick data quality
+    market_evidence_min_activity_intensity: float = 0.40
+    market_evidence_max_activity_intensity: float = 4.00
+    # Price-action component
+    market_evidence_price_action_threshold: float = 0.20
+    market_evidence_headroom_min_atr: float = 0.35
+    # Combination
+    market_evidence_require_both_components: bool = True
+    market_evidence_activity_weight: float = 0.45
+    market_evidence_price_action_weight: float = 0.55
+
 
 class RuntimeSettings(BaseModel):
     # Active market/execution provider. None => use env MARKET_PROVIDER.

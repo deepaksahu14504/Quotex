@@ -677,3 +677,142 @@ def test_data_quality_checks_degrade_gracefully():
     rep4 = QualityReport()
     mgr.observe_ticks("EURUSD", "1m", [{"time": "bad"}], period_seconds=60.0, report=rep4)
     assert "malformed_tick" in rep4.flags
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 17. the integration point itself is wired
+# ────────────────────────────────────────────────────────────────────────────
+USER = "feat-integration"
+
+
+@pytest.fixture
+def orch(pg, tmp_path, monkeypatch):
+    """A real Orchestrator (needs a live DB) with a stub provider."""
+    from app.config import RuntimeSettings
+    from app.orchestrator import Orchestrator
+    from app.session_manager import BrokerCredentials, session_manager
+
+    creds = BrokerCredentials(
+        quotex_email="broker@example.invalid", quotex_password="pw", quotex_is_demo=True
+    )
+    monkeypatch.setattr(session_manager, "get_credentials", lambda uid: creds)
+    monkeypatch.setattr(session_manager, "set_account_type", lambda uid, d: True)
+    monkeypatch.setattr(RuntimeSettings, "save", lambda self, user_id=None: None)
+    return Orchestrator(USER, RuntimeSettings())
+
+
+class _SentimentProvider:
+    """Stub provider exposing the two new optional methods."""
+
+    def __init__(self, sentiment=None, ticks=None, raise_on_sentiment=False):
+        self._sentiment = sentiment
+        self._ticks = ticks or []
+        self._raise = raise_on_sentiment
+        self.sentiment_calls = 0
+        self.tick_calls = 0
+
+    async def get_realtime_sentiment(self, asset):
+        self.sentiment_calls += 1
+        if self._raise:
+            raise RuntimeError("broker sentiment stream unavailable")
+        return self._sentiment
+
+    async def get_realtime_ticks(self, asset):
+        self.tick_calls += 1
+        return self._ticks
+
+
+@pytest.mark.asyncio
+async def test_collect_market_features_is_actually_wired(orch):
+    """The orchestrator must call the provider and return a usable bundle.
+
+    Guards the integration point itself: the helper-level tests above would
+    still pass if `_collect_market_features` never called the provider, or
+    never returned an adjustment the caller could use.
+    """
+    orch.provider = _SentimentProvider(
+        sentiment={"call": 88, "put": 12}, ticks=tick_list(6),
+    )
+    edf = strategies._enrich(candles_to_df(make_candles(200)))
+
+    feats, adj = await orch._collect_market_features(
+        "EURUSD", "1m", edf, direction_value="CALL",
+    )
+    assert orch.provider.sentiment_calls == 0, (
+        "sentiment is disabled by default, so no provider call should be made"
+    )
+    assert orch.provider.tick_calls == 1, "tick activity is collected regardless"
+    assert feats.asset == "EURUSD" and feats.timeframe == "1m"
+    assert feats.sentiment.available is False
+    assert feats.tick.tick_count == 6
+    # sentiment is DISABLED by default, so the nudge must be exactly 0.0.
+    assert adj.adjustment == 0.0 and adj.reason == "disabled"
+
+    # Now enable it: same provider, same data, bounded positive nudge.
+    orch.runtime.market_data.sentiment_enabled = True
+    orch._realtime.reset()
+    feats2, adj2 = await orch._collect_market_features(
+        "EURUSD", "1m", edf, direction_value="CALL",
+    )
+    assert orch.provider.sentiment_calls == 1, "enabling sentiment must reach the provider"
+    assert feats2.sentiment.available is True
+    assert feats2.sentiment.bias == pytest.approx(0.76)
+    assert adj2.applied is True and adj2.reason == "agrees"
+    assert 0.0 < adj2.adjustment <= orch.runtime.market_data.sentiment_max_confidence_adjustment
+
+
+@pytest.mark.asyncio
+async def test_collect_market_features_survives_a_broken_sentiment_stream(orch):
+    """A provider whose sentiment call raises must not break signal generation."""
+    orch.provider = _SentimentProvider(raise_on_sentiment=True, ticks=tick_list(3))
+    orch.runtime.market_data.sentiment_enabled = True
+    edf = strategies._enrich(candles_to_df(make_candles(200)))
+
+    feats, adj = await orch._collect_market_features(
+        "EURUSD", "1m", edf, direction_value="PUT",
+    )
+    assert adj.adjustment == 0.0
+    assert feats.sentiment.available is False
+    assert feats.tick.tick_count == 3  # ticks still collected
+
+
+@pytest.mark.asyncio
+async def test_collect_market_features_handles_a_provider_without_sentiment(orch):
+    """A provider with no sentiment method at all must degrade, not raise."""
+    class _LegacyProvider:
+        async def get_realtime_sentiment(self, asset):
+            return None
+        async def get_realtime_ticks(self, asset):
+            return []
+
+    orch.provider = _LegacyProvider()
+    orch.runtime.market_data.sentiment_enabled = True
+    edf = strategies._enrich(candles_to_df(make_candles(200)))
+    feats, adj = await orch._collect_market_features(
+        "EURUSD", "1m", edf, direction_value="CALL",
+    )
+    assert adj.adjustment == 0.0
+    assert "missing_sentiment" in feats.quality.flags
+
+
+def test_market_features_log_fields_carry_no_secrets():
+    """The structured log payload must expose features only."""
+    feats = MarketFeatures(asset="EURUSD", timeframe="1m", candle_ts=1_700_000_000.0,
+                           price=1.1042)
+    adj = sentiment_confidence_adjustment(None, direction="CALL", enabled=True)
+    fields = _market_log_fields(feats, adj, 70, 74, 62)
+
+    for required in ("asset", "timeframe", "candle_ts", "price", "data_quality",
+                     "tick_activity", "sentiment_buy", "sentiment_sell",
+                     "sentiment_bias", "sentiment_stale", "base_confidence",
+                     "sentiment_adjustment", "final_confidence", "effective_threshold"):
+        assert required in fields, f"missing observability field {required}"
+
+    blob = repr(fields).lower()
+    for banned in ("password", "cookie", "token", "session", "ssid", "csrf", "secret"):
+        assert banned not in blob, f"observability payload leaked {banned!r}"
+
+
+def _market_log_fields(features, adj, base, final, threshold):
+    from app.orchestrator import Orchestrator
+    return Orchestrator._market_features_log_fields(features, adj, base, final, threshold)

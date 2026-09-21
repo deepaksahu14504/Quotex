@@ -200,6 +200,18 @@ no-secret log assertion, integration wiring).
 `import app.main` → 69 routes. Secrets guard: 9 passed. `git ls-files` matches
 for `session.json` / `backend/data/`: **0 tracked**.
 
+**Frontend — verified, not assumed.** No frontend or API-contract file was
+touched by this task (`git diff --name-only 64e2c43..HEAD | grep '^frontend/'`
+→ none), and the frontend reads neither `volume` nor `volume_source`
+(`grep -rn "volume_source\|\.volume\b" frontend/src` → no matches). Still built
+it to be sure:
+
+- `npm run build` (`tsc -b && vite build`) → **passes**, 322 modules transformed,
+  no type errors.
+- `npm run lint` (oxlint) → 1 error + 3 warnings, **all pre-existing**: the
+  error is a conditional `useState` at `src/components/Settings.tsx:165`, and
+  that identical line is present on `origin/main`. None of it is introduced here.
+
 **Pre-fix proofs** (each fix reverted, test run, fix restored):
 - `candle_store` read-back → hardcoded `"real"`: `test_candle_store_persists_volume_source` fails (`'real' != 'synthetic'`)
 - windowed copy-back → old 10-column list: `test_incremental_engine_preserves_new_feature_fields` fails (row 60 all-NaN across all 20 columns)

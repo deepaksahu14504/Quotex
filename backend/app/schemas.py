@@ -5,7 +5,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -240,6 +240,23 @@ class SignalDecision(BaseModel):
     # calibrated_confidence using TradingSettings.decision_historical_probability_weight /
     # decision_regime_weight / decision_calibration_weight -- informational only (Monitoring),
     # never used as a gate
+
+    # Market Evidence attribution (see engine/market_evidence.py). Kept as its
+    # own field and deliberately NOT folded into `raw_features`: that dict is
+    # confidence_model.FEATURE_NAMES keyed and doubles as Phase 5's training-set
+    # join key, so adding entries there would silently change the ML feature
+    # vector and invalidate every persisted model (confidence_model.py refuses a
+    # model whose fitted length differs from len(FEATURE_NAMES)).
+    #
+    # Carries the full confidence chain so the UI can show WHY a signal got the
+    # confidence it did: raw_strategy_confidence, regime_adjustment,
+    # market_evidence_adjustment, activity_score, tick_direction_balance,
+    # intrabar_momentum, price_action_score, final_before_calibration,
+    # calibrated_confidence, effective_threshold, agreeing/opposing strategies.
+    #
+    # Optional with a None default, so a SignalDecision persisted before this
+    # existed still deserializes -- backward compatible, no migration.
+    market_evidence: Optional[Dict[str, Any]] = None
 
     final_decision: str = "rejected"        # "accepted" | "rejected"
     rejection_reason: Optional[str] = None  # populated whenever final_decision == "rejected";

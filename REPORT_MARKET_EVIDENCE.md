@@ -4,9 +4,9 @@ Repo `/home/user/Quotex` · branch `arena/01a0bee8-quotex`
 Commits: `847a97a`, `2161f35`, `bbcdc64`
 Inspection: `INSPECTION_MARKET_EVIDENCE.md` (written before any change)
 
-**Verified:** full backend suite **501 passed / 1 skipped** (was 458/1).
+**Verified:** full backend suite **503 passed / 1 skipped** (was 458/1).
 `import app.main` → 69 routes. One real signal traced end to end through the
-actual `_evaluate_asset_signal`.
+actual `_evaluate_asset_signal`, with the persisted decision record read back.
 
 ---
 
@@ -16,8 +16,9 @@ actual `_evaluate_asset_signal`.
 |---|---|---|
 | `backend/app/engine/market_evidence.py` | **+470 (new)** | The scoring layer. `EvidenceConfig`, `MarketEvidence`, `activity_score()`, `price_action_score()`, `headroom_dampener()`, `evaluate_market_evidence()`. Needed because nothing combined tick activity and price action into one bounded number. |
 | `backend/app/config.py` | +21 | 12 `market_evidence_*` settings (rule 9). Added to the existing `MarketDataSettings` rather than a new class so one settings object still covers all market-data behaviour. |
-| `backend/app/orchestrator.py` | +178/−15 | Wiring: `_evaluate_market_evidence()`, `EVIDENCE_ROW_FIELDS`, the adjustment at the existing post-regime/pre-calibration slot, and full attribution on all three outcomes (generated, confidence-rejected, precision-rejected). |
-| `backend/test_market_evidence.py` | **+615 (new)** | 43 tests (rule 10). |
+| `backend/app/orchestrator.py` | +189/−16 | Wiring: `_evaluate_market_evidence()`, `EVIDENCE_ROW_FIELDS`, the adjustment at the existing post-regime/pre-calibration slot, and full attribution on all three outcomes (generated, confidence-rejected, precision-rejected) plus onto the persisted decision record. |
+| `backend/app/schemas.py` | +19/−1 | `SignalDecision.market_evidence` field, so the attribution reaches the UI and the `/api/pipeline` endpoints and not just the log stream (rule 8: "logs/UI can show"). Own field, not `raw_features` — see §9. |
+| `backend/test_market_evidence.py` | **+670 (new)** | 45 tests (rule 10). |
 | `backend/test_market_features.py` | +19/−15 | 3 call sites updated for the now-3-tuple `_collect_market_features`; the no-secrets test updated for the intentional `asset`/`timeframe` removal (see §9). |
 | `INSPECTION_MARKET_EVIDENCE.md` | **+137 (new)** | The inspect-only findings this design is based on, including the double-counting analysis. |
 
@@ -123,9 +124,9 @@ than unreachable. Caps are re-clamped at the end of
 ## 6. Test results
 
 ```
-501 passed, 1 skipped in 47.72s
+503 passed, 1 skipped in 47.53s
 ```
-was 458/1 → **+43 tests**, no regression.
+was 458/1 → **+45 tests**, no regression.
 
 All twelve behaviours rule 10 named, plus extras:
 
@@ -205,7 +206,57 @@ This test exists because of a real bug: the first version prefixed only
 dataclass defaults. Invisible in a smoke test, since the defaults match — only
 setting a non-default value exposed it.
 
-## 9. Two bugs found and fixed while building this
+## 9. UI reachability — the gap the first pass left open
+
+Rule 8 says the attribution must be there so **logs/UI** can show it. The first
+pass only got the logs. `grep -nE "market_evidence|activity_score|..."` over
+`app/schemas.py` returned **NONE** — the attribution never left the log stream,
+so nothing the UI reads carried it.
+
+Closed by adding `SignalDecision.market_evidence: Optional[Dict[str, Any]]`.
+`SignalDecision` is the record `DecisionStore` persists for *both* accepted and
+rejected decisions and is what the `/api/pipeline` endpoints serve, so it is the
+right carrier. Verified against a real signal with
+`decision_engine_enabled=True` (it defaults to `False`, which is why the first
+trace silently persisted nothing at all):
+
+```
+records written by the real trace run: 1
+asset=EURUSD final=rejected
+market_evidence keys: 40
+   raw_strategy_confidence    97.0
+   market_evidence_adjustment 1.8229
+   activity_score             0.6875
+   price_action_score         0.8617
+   final_before_calibration   98.8229
+   calibrated_confidence      98.8229
+   effective_threshold        62.05405405405405
+   agreeing_strategies        ['ema_ribbon','supertrend','adx_di', ...]
+   opposing_strategies        ['mean_reversion','vol_norm_reversion']
+top-level rejection_reason    precision_gate: 2 strategies voted opposite
+```
+
+Two deliberate choices, both pinned by tests:
+
+- **Its own field, not `raw_features`.** `raw_features` is
+  `confidence_model.FEATURE_NAMES` keyed and doubles as Phase 5's training-set
+  join key. Adding evidence entries there would silently change the ML feature
+  vector and invalidate every persisted model — the exact thing rule 11 forbids.
+  The trace confirms `raw_features` still holds only the 12 `FEATURE_NAMES`
+  entries.
+- **`Dict[str, Any]`, not `Dict[str, float]`.** The real payload contains
+  `str` (`market_evidence_verdict`), `list` (`agreeing_strategies`), `bool`
+  (`sentiment_applied`), `int`, and `None`. A `float`-typed mapping would have
+  rejected all five. Verified by constructing a `SignalDecision` from the actual
+  mixed-type payload.
+
+Backward compatible — a record persisted before the field existed
+deserializes with `market_evidence=None`, no migration
+(`test_signal_decision_carries_attribution_without_touching_the_ml_join_key`).
+Persistence through the JSONL store is covered by
+`test_evidence_attribution_survives_the_decision_store_round_trip`.
+
+## 10. Three bugs found and fixed while building this
 
 1. **`EvidenceConfig.from_settings` ignored 11 of 12 settings.** Silent, because
    defaults matched. Now an explicit mapping, asserted complete both ways.
@@ -216,8 +267,9 @@ setting a non-default value exposed it.
    shipped in the previous task — the helper-level test could not catch it, only
    splatting the way real call sites do. Fixed by dropping both keys in the
    helper; regression test proven to fail pre-fix.
+3. **Attribution never reached the UI.** Logs only (§9).
 
-## 10. Remaining reasons a signal can still fail the threshold
+## 11. Remaining reasons a signal can still fail the threshold
 
 The evidence layer did not weaken any gate, so all pre-existing rejection paths
 remain live. A signal can still fail because:
@@ -245,7 +297,7 @@ remain live. A signal can still fail because:
    intrabar range, or price action below threshold. This is neutral by design; it
    neither helps nor hurts.
 
-## 11. Not done / caveats
+## 12. Not done / caveats
 
 - **No accuracy or win-rate claim is made.** No backtest here would support one,
   and no threshold was lowered to generate more signals. The default cap is 5

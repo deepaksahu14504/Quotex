@@ -613,3 +613,58 @@ def test_attribution_is_safe_to_splat_alongside_explicit_call_site_fields():
                confidence=74, **fields)
     assert out[0] == "EURUSD" and out[1] == "1m"
     assert out[2]["market_evidence_adjustment"] == 1.5
+
+
+def test_signal_decision_carries_attribution_without_touching_the_ml_join_key():
+    """Rule 8 says logs AND UI must be able to show the attribution.
+
+    `SignalDecision` is the record persisted for both accepted and rejected
+    decisions and served back through the pipeline endpoints, so the attribution
+    has to ride on it — not just in the log stream. It must land in its own
+    field, because `raw_features` is confidence_model.FEATURE_NAMES keyed and
+    doubles as Phase 5's training-set join key: adding entries there would
+    silently change the ML feature vector.
+    """
+    from app.schemas import SignalDecision
+
+    attribution = {
+        "raw_strategy_confidence": 97.0, "regime_adjustment": 0.0,
+        "market_evidence_adjustment": 1.8229, "activity_score": 0.6875,
+        "tick_direction_balance": 1.0, "intrabar_momentum": 0.003791,
+        "price_action_score": 0.8617, "final_before_calibration": 98.8229,
+        "calibrated_confidence": 98.8229, "effective_threshold": 62.05,
+        "agreeing_strategies": ["a", "b"], "opposing_strategies": ["c"],
+        "market_evidence_verdict": "confirms",
+    }
+    d = SignalDecision(asset="EURUSD", timeframe="1m", market_evidence=attribution)
+    assert d.market_evidence["market_evidence_adjustment"] == 1.8229
+
+    # The ML join key stays exactly FEATURE_NAMES-keyed.
+    from app.engine.confidence_model import FEATURE_NAMES
+    assert d.raw_features is None or set(d.raw_features) <= set(FEATURE_NAMES)
+
+    # Backward compatible: a record written before this field existed.
+    legacy = SignalDecision.model_validate({"asset": "X", "timeframe": "1m"})
+    assert legacy.market_evidence is None
+
+
+def test_evidence_attribution_survives_the_decision_store_round_trip():
+    """The attribution must survive JSONL persistence, not just live in memory."""
+    import json
+    import tempfile
+    from app.schemas import SignalDecision
+    from app.engine.decision_engine import DecisionStore
+
+    with tempfile.TemporaryDirectory() as td:
+        store = DecisionStore(td)
+        store.append(SignalDecision(
+            asset="EURUSD", timeframe="1m", final_decision="rejected",
+            rejection_reason="precision_gate: counter-vote veto",
+            market_evidence={"market_evidence_adjustment": 1.8229,
+                             "agreeing_strategies": ["a", "b"],
+                             "market_evidence_verdict": "confirms"}))
+        back = store.read_recent(5)
+        assert len(back) == 1
+        assert back[0].market_evidence["market_evidence_adjustment"] == 1.8229
+        assert back[0].market_evidence["agreeing_strategies"] == ["a", "b"]
+        assert back[0].rejection_reason.startswith("precision_gate")

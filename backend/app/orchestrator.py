@@ -3471,6 +3471,17 @@ class Orchestrator:
         except Exception:
             attribution = {}
 
+        # Persist the same attribution onto the decision record so the UI and
+        # /api/pipeline endpoints can show it, not just the log stream. Written
+        # before either rejection branch below so accepted AND rejected
+        # decisions both carry it (rule 8: every evaluated signal). Kept off
+        # `decision.raw_features`, which is the FEATURE_NAMES-keyed ML join key.
+        if decision is not None and attribution:
+            try:
+                decision.market_evidence = dict(attribution)
+            except Exception:
+                pass
+
         if calibrated_confidence < effective_threshold:
             if decision is not None:
                 decision.final_decision = "rejected"

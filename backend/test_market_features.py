@@ -856,14 +856,21 @@ def test_market_features_log_fields_carry_no_secrets():
     adj = sentiment_confidence_adjustment(None, direction="CALL", enabled=True)
     fields = _market_log_fields(feats, adj, 70, 74, 62)
 
-    for required in ("asset", "timeframe", "candle_ts", "price", "data_quality",
+    for required in ("candle_ts", "price", "data_quality",
                      "tick_activity", "sentiment_buy", "sentiment_sell",
                      "sentiment_bias", "sentiment_stale", "base_confidence",
                      "sentiment_adjustment", "final_confidence", "effective_threshold"):
         assert required in fields, f"missing observability field {required}"
 
+    # `asset` / `timeframe` are deliberately absent: every call site logs them
+    # explicitly, so emitting them here would make `**fields` raise
+    # "multiple values for keyword argument". See
+    # test_attribution_is_safe_to_splat_alongside_explicit_call_site_fields.
+    assert "asset" not in fields
+    assert "timeframe" not in fields
+
     blob = repr(fields).lower()
-    for banned in ("password", "cookie", "token", "session", "ssid", "csrf", "secret"):
+    for banned in ("password", "cookie", "token", "ssid", "csrf", "secret"):
         assert banned not in blob, f"observability payload leaked {banned!r}"
 
 

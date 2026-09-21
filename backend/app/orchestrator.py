@@ -2417,7 +2417,14 @@ class Orchestrator:
         out: dict = {}
         if features is not None:
             try:
-                out.update(features.flat())
+                flat = features.flat()
+                # Every call site already logs `asset` and `timeframe`
+                # explicitly, and `log_event(**fields)` would raise
+                # "multiple values for keyword argument" on a duplicate.
+                # Dropping them here keeps the helper safe to splat anywhere.
+                flat.pop("asset", None)
+                flat.pop("timeframe", None)
+                out.update(flat)
             except Exception:
                 pass
         if sentiment_adj is not None:
@@ -3507,6 +3514,19 @@ class Orchestrator:
                 self._persist_decision(decision, asset.symbol)
                 self.latency.drop(latency_key)
                 self._pipeline_snapshot(asset.symbol, tf, stage="rejected", stage_reason=pg.reason, regime=res.regime)
+                # Rule 8: a precision-gate rejection is still an evaluated
+                # signal, so it carries the same attribution as every other
+                # outcome. This is the case that most needs auditing -- the
+                # confidence was fine, and the reason is vote structure.
+                log_event(
+                    logger, logging.INFO, "signal_rejected_precision",
+                    asset=asset.symbol, timeframe=tf,
+                    direction=res.direction.value if res.direction else None,
+                    regime=res.regime,
+                    rejection_reason=f"precision_gate: {pg.reason}",
+                    precision_agreeing=pg.agreeing, precision_opposing=pg.opposing,
+                    **attribution,
+                )
                 return asset.symbol, None, res.regime, latency_key
 
         row_last = edf.iloc[-1]

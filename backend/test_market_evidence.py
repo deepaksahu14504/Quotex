@@ -580,3 +580,36 @@ def test_attribution_fields_are_complete(orch):
     blob = repr(fields).lower()
     for banned in ("password", "cookie", "token", "ssid", "csrf", "secret", "session.json"):
         assert banned not in blob, f"attribution leaked {banned!r}"
+
+
+def test_attribution_is_safe_to_splat_alongside_explicit_call_site_fields():
+    """Regression: `**attribution` collided with the call site's own kwargs.
+
+    `MarketFeatures.flat()` emits `asset` and `timeframe`, and every call site
+    (signal_generated, signal_rejected_confidence, signal_rejected_precision)
+    also passes those explicitly. `log_event(**fields)` then raised
+    "got multiple values for keyword argument 'asset'". A helper-level test
+    could not catch this — only splatting the way the real call sites do can.
+    """
+    from app.orchestrator import Orchestrator
+    from app.engine.market_features import MarketFeatures
+
+    feats = MarketFeatures(asset="EURUSD", timeframe="1m", candle_ts=1.0, price=1.1)
+    ev = MarketEvidence(adjustment=1.5)
+    fields = Orchestrator._market_features_log_fields(
+        feats, None, 70.0, 74.0, 62.0, market_ev=ev,
+        raw_strategy_confidence=66.0, regime_adjustment=4.0,
+        final_before_calibration=71.5, agreeing_strategies=["a"],
+        opposing_strategies=["b"], rejection_reason="r",
+    )
+    for banned in ("asset", "timeframe"):
+        assert banned not in fields, f"{banned} would collide with the call site"
+
+    # The real failure mode: splatting next to the explicit kwargs.
+    def sink(*, signal_id, asset, timeframe, direction, confidence, **rest):
+        return asset, timeframe, rest
+
+    out = sink(signal_id="s1", asset="EURUSD", timeframe="1m", direction="call",
+               confidence=74, **fields)
+    assert out[0] == "EURUSD" and out[1] == "1m"
+    assert out[2]["market_evidence_adjustment"] == 1.5

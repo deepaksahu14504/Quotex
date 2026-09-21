@@ -8,6 +8,8 @@ that calls a new function directly still passes when nothing ever calls it.
 
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -677,6 +679,58 @@ def test_data_quality_checks_degrade_gracefully():
     rep4 = QualityReport()
     mgr.observe_ticks("EURUSD", "1m", [{"time": "bad"}], period_seconds=60.0, report=rep4)
     assert "malformed_tick" in rep4.flags
+
+
+def test_pyquotex_tick_fold_never_puts_tick_count_into_volume(tmp_path):
+    """RCA C.2: the live tick-fold must leave `volume` at 0.
+
+    `get_candles()` used to do `row["volume"] += 1.0` per tick (and the
+    history/resync/fetch_history paths copied `ticks` into `volume`), so a
+    field named `volume` carried a tick count. The synthetic tag neutralised
+    it in memory, but any consumer that forgot the tag did order-flow maths on
+    it — which is what happened through the PG round-trip before 0002.
+    Drives the real provider method, not a reimplementation of the fold.
+    """
+    from app.services.market import PyQuotexProvider
+
+    bucket = float(int(1_700_000_000.0 // 60 * 60))
+    p = PyQuotexProvider("a@example.invalid", "pw", is_demo=True,
+                         sessions_dir=str(tmp_path))
+    p._connected = True
+    p._streamed.add(("EURUSD", 60))
+    p._last_resync["EURUSD:60"] = 9e18  # force the tick-fold path, not history
+
+    class _Client:
+        async def get_realtime_price(self, asset):
+            return [{"time": 1_700_000_000.0 + i, "price": 1.10 + i * 0.0001}
+                    for i in range(7)]
+
+    p._client = _Client()
+    # Pre-seed >= count closed bars so `seed_needed` is False.
+    p._candle_cache["EURUSD:60"] = {
+        bucket - 60 * (20 - i): {
+            "time": bucket - 60 * (20 - i), "open": 1.09, "high": 1.095,
+            "low": 1.085, "close": 1.09, "volume": 0.0, "ticks": 0,
+            "_volume_source": "synthetic",
+        }
+        for i in range(20)
+    }
+
+    cs = asyncio.run(p.get_candles("EURUSD", "1m", 10))
+    live = [c for c in cs if c.timestamp == bucket]
+    assert live, "the folded live bar is missing"
+    live = live[0]
+
+    assert live.volume == 0.0, "tick count leaked into the volume field"
+    assert live.volume_source == "synthetic"
+    # The activity count is still recorded, just not in `volume`.
+    assert p._candle_cache["EURUSD:60"][bucket]["ticks"] == 7
+    assert p._candle_cache["EURUSD:60"][bucket]["volume"] == 0.0
+    # OHLC was still folded correctly from the ticks.
+    assert live.open == pytest.approx(1.10)
+    assert live.close == pytest.approx(1.1006)
+    # And nothing else in the frame carries a synthetic number as volume.
+    assert all(c.volume == 0.0 and c.volume_source == "synthetic" for c in cs)
 
 
 # ────────────────────────────────────────────────────────────────────────────

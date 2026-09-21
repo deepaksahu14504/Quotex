@@ -1726,13 +1726,14 @@ class PyQuotexProvider(MarketProvider):
                             except (TypeError, ValueError):
                                 c_real_vol = False
                             if not c_real_vol:
-                                if "ticks" in c:
-                                    try:
-                                        c["volume"] = float(c["ticks"])
-                                    except Exception:
-                                        c["volume"] = 0.0
-                                else:
-                                    c["volume"] = 0.0
+                                # RCA C.2: a tick count is NOT a traded
+                                # volume, so it no longer gets copied into
+                                # this field. `volume` stays 0 when the
+                                # broker published no real volume; the count
+                                # remains available under "ticks" and is
+                                # surfaced through the tick-activity
+                                # features instead.
+                                c["volume"] = 0.0
                             c["_volume_source"] = "real" if c_real_vol else "synthetic"
                             cache[float(c["time"])] = c
                             stored += 1
@@ -1773,13 +1774,8 @@ class PyQuotexProvider(MarketProvider):
                         except (TypeError, ValueError):
                             c_real_vol = False
                         if not c_real_vol:
-                            if "ticks" in c:
-                                try:
-                                    c["volume"] = float(c["ticks"])
-                                except Exception:
-                                    c["volume"] = 0.0
-                            else:
-                                c["volume"] = 0.0
+                            # RCA C.2: tick count is activity, not volume.
+                            c["volume"] = 0.0
                         c["_volume_source"] = "real" if c_real_vol else "synthetic"
                         cache[float(c["time"])] = c
             except asyncio.CancelledError:
@@ -1813,27 +1809,28 @@ class PyQuotexProvider(MarketProvider):
                 bucket = float(int(ts // period * period))
                 row = cache.get(bucket)
                 if row is None:
-                    # Binary: open=new tick, volume=tick count (synthetic proxy).
-                    # Tagged _volume_source="synthetic" so indicators know this
-                    # is tick-count activity, not real exchange volume.
+                    # RCA C.2: `volume` is 0 here on purpose. Quotex tick
+                    # frames carry no volume field at all (api.py:790), so
+                    # there is nothing honest to put in it. The activity
+                    # count lives in "ticks" and is tagged synthetic so
+                    # indicators treat any volume maths as neutral.
                     cache[bucket] = {"time": bucket, "open": price, "high": price,
-                                     "low": price, "close": price, "volume": 1.0,
+                                     "low": price, "close": price, "volume": 0.0,
                                      "ticks": 1, "_volume_source": "synthetic"}
                 else:
                     row["close"] = price
                     row["high"] = max(row["high"], price)
                     row["low"] = min(row["low"], price)
-                    # Increment tick-count volume proxy — gives an activity
-                    # measure for the live candle. Because this is built from
-                    # raw ticks it is ALWAYS synthetic (pyquotex tick frames
-                    # have no volume field at all, see api.py:790).
+                    # Count the tick as ACTIVITY only. This used to also do
+                    # `row["volume"] += 1.0`, which put a tick count in a
+                    # field named volume; every consumer that forgot the
+                    # synthetic tag then did order-flow maths on it.
                     if row.get("_volume_source") != "real":
                         row["_volume_source"] = "synthetic"
                     try:
-                        row["volume"] = float(row.get("volume", 0) or 0) + 1.0
                         row["ticks"] = int(row.get("ticks", 0) or 0) + 1
                     except Exception:
-                        row["volume"] = 1.0
+                        row["ticks"] = 1
                 folded.append(t)
             self._advance_tick_cursor(asset, period, ticks, folded)
 
@@ -1847,14 +1844,10 @@ class PyQuotexProvider(MarketProvider):
             try:
                 vol = c.get("volume", 0) or 0
                 v_src = c.get("_volume_source") or "synthetic"
-                if not vol and "ticks" in c:
-                    try:
-                        vol = float(c["ticks"])
-                    except Exception:
-                        vol = 0
-                # If the broker somehow returned a real volume field > 0,
-                # honour it; otherwise everything pyquotex produces here is
-                # tick-count proxy.
+                # RCA C.2: the `ticks` -> `volume` fallback is gone. A tick
+                # count is not a traded volume, so when the broker published
+                # no real volume this stays 0 and the tag stays "synthetic".
+                # Honour a real volume field only if the broker sent one.
                 out.append(Candle(timestamp=float(c["time"]), open=float(c["open"]), high=float(c["high"]),
                                   low=float(c["low"]), close=float(c["close"]), volume=float(vol),
                                   volume_source=v_src))
@@ -1895,12 +1888,9 @@ class PyQuotexProvider(MarketProvider):
                         c_real_vol = True
                 except (TypeError, ValueError):
                     c_real_vol = False
+                # RCA C.2: honour a real broker volume only. The previous
+                # `ticks` fallback put a tick count into `volume`.
                 vol = c.get("volume", 0) or 0
-                if not vol and "ticks" in c:
-                    try:
-                        vol = float(c["ticks"])
-                    except Exception:
-                        vol = 0
                 out.append(Candle(timestamp=float(c["time"]), open=float(c["open"]), high=float(c["high"]),
                                   low=float(c["low"]), close=float(c["close"]), volume=float(vol),
                                   volume_source="real" if c_real_vol else "synthetic"))

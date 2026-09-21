@@ -106,7 +106,7 @@ wick information into three votes.
   runs **before** the confluence score, so correlated strategy groups are already
   capped. The evidence layer reads only `res.votes` for attribution and never
   adds confidence for vote count.
-- **FEATURE_NAMES (rule 11):** `confidence_model.py:51-64`, 13 entries
+- **FEATURE_NAMES (rule 11):** `confidence_model.py:51-64`, **12** entries
   (`net, win_n, directional_edge, body_ratio, atr_pct, htf_agree, hhtf_agree,
   is_trend, is_range, regime_transition_probability,
   regime_transition_confidence, regime_stability_score`). Will **not** be

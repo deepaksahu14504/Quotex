@@ -303,8 +303,8 @@ remain live. A signal can still fail because:
   and no threshold was lowered to generate more signals. The default cap is 5
   points against thresholds in the 55–65 range, so this cannot manufacture
   signals on its own.
-- **`FEATURE_NAMES` is unchanged** (rule 11) — all 13 entries asserted
-  byte-identical. Extending it would silently disable every persisted model,
+- **`FEATURE_NAMES` is unchanged** (rule 11) — all **12** entries asserted
+  byte-identical by `test_feature_names_vector_is_not_extended`. Extending it would silently disable every persisted model,
   because `confidence_model.py:145` refuses a model whose fitted length differs.
   The evidence is exposed separately via `MarketEvidence.as_dict()`, so ML
   integration later needs no change to the existing vector.

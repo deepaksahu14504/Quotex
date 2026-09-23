@@ -259,6 +259,16 @@ export interface RuntimeSettings {
     send_results: boolean;
     allow_commands: boolean;
   };
+  // Realtime market-data feature layer (backend MarketDataSettings). Only the
+  // fields the UI surfaces are typed; the rest still round-trips untouched
+  // because the whole settings object is PUT back to /api/settings.
+  market_data?: {
+    sentiment_enabled?: boolean;
+    sentiment_max_age_seconds?: number;
+    sentiment_min_strength?: number;
+    sentiment_max_confidence_adjustment?: number;
+    [key: string]: unknown;
+  };
 }
 
 export type StatusLevel = "ok" | "warn" | "error" | "info";

@@ -466,6 +466,24 @@ export function Settings({ open, onClose }: { open: boolean; onClose: () => void
                 </Row>
               </Section>
 
+              <Section title="Sentiment Adjustment" subtitle="A small, bounded confidence nudge from trader sentiment. It can never pick or reverse a direction, never replaces the OHLC/indicator/confluence signal, and is skipped entirely (adjustment 0) when sentiment is missing, stale or the provider call fails -- so turning it on cannot block a signal. ON by default.">
+                <Row label="Sentiment Adjustment" hint={(draft.market_data?.sentiment_enabled ?? true) ? "On - bounded sentiment nudge applies" : "Off - sentiment is completely bypassed"}>
+                  <Toggle
+                    checked={draft.market_data?.sentiment_enabled ?? true}
+                    onChange={(v) => patch({ market_data: { ...draft.market_data, sentiment_enabled: v } })}
+                  />
+                </Row>
+                <Row label="Max adjustment (confidence points)" hint="Hard cap on how far sentiment may move confidence, in either direction">
+                  <NumberInput value={draft.market_data?.sentiment_max_confidence_adjustment ?? 4} step={0.5} onChange={(v) => patch({ market_data: { ...draft.market_data, sentiment_max_confidence_adjustment: v } })} />
+                </Row>
+                <Row label="Max age (seconds)" hint="Sentiment older than this is ignored, not penalised">
+                  <NumberInput value={draft.market_data?.sentiment_max_age_seconds ?? 120} onChange={(v) => patch({ market_data: { ...draft.market_data, sentiment_max_age_seconds: v } })} />
+                </Row>
+                <Row label="Min strength" hint="Bias weaker than this is ignored (0.10 = 10 percentage points)">
+                  <NumberInput value={draft.market_data?.sentiment_min_strength ?? 0.1} step={0.01} onChange={(v) => patch({ market_data: { ...draft.market_data, sentiment_min_strength: v } })} />
+                </Row>
+              </Section>
+
               <Section title="Adaptive Intelligence" subtitle="Learns thresholds from each asset's own recent behavior instead of using one fixed number for everyone. Off by default -- turning it on only changes behavior for the specific toggles enabled below, and each one falls back cleanly to the original fixed behavior when switched off.">
                 <Row label="Adaptive Mode" hint="Master switch -- must be on for any toggle below to do anything">
                   <Toggle checked={!!draft.trading.adaptive_mode_enabled} onChange={(v) => patch({ trading: { ...draft.trading, adaptive_mode_enabled: v } })} />

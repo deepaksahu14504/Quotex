@@ -698,7 +698,15 @@ class MarketDataSettings(BaseModel):
     tick_baseline_bars: int = 40              # closed bars used as the activity baseline
 
     # ── trader sentiment (optional, bounded, never a signal source) ────────
-    sentiment_enabled: bool = False           # OFF by default: opt-in only
+    sentiment_enabled: bool = True            # ON by default; user can turn it OFF
+    # Records whether `sentiment_enabled` above was an *explicit* user choice.
+    # Needed because save() writes every field, so a stored `false` is otherwise
+    # indistinguishable from the pre-2024 default that this codebase shipped with:
+    # a user who never touched sentiment looks exactly like one who turned it
+    # off. RuntimeSettings.load() only migrates a `false` to `true` while this is
+    # absent/false; apply_settings() sets it the moment the user flips the toggle,
+    # after which their choice is never overwritten again.
+    sentiment_enabled_set_by_user: bool = False
     sentiment_max_age_seconds: float = 120.0  # older than this => ignored, not penalised
     sentiment_min_strength: float = 0.10      # |bias| below this => ignored (10 percentage pts)
     sentiment_max_confidence_adjustment: float = 4.0   # hard cap, in confidence points (3-5)
@@ -746,7 +754,37 @@ class RuntimeSettings(BaseModel):
         path = user_data_dir(user_id) / "runtime_settings.json" if user_id else SETTINGS_FILE
         if path.exists():
             try:
-                inst = cls.model_validate_json(path.read_text(encoding="utf-8"))
+                raw_text = path.read_text(encoding="utf-8")
+                inst = cls.model_validate_json(raw_text)
+                # ── Sentiment Adjustment default-ON migration ────────────────
+                # This codebase originally shipped `sentiment_enabled = False`,
+                # and save() writes every field, so every existing
+                # runtime_settings.json contains an explicit-looking
+                # `"sentiment_enabled": false` that was never a user choice.
+                # The class default alone therefore cannot reach those files.
+                #
+                # A stored false is only migrated to true while the user has
+                # never made an explicit choice (`sentiment_enabled_set_by_user`
+                # absent or false in the RAW file — the validated model would
+                # have filled the default, hiding the difference). Once
+                # apply_settings() records an explicit toggle, the preference is
+                # preserved across every restart, including an explicit OFF.
+                try:
+                    import json as _json
+                    _raw_md = (_json.loads(raw_text) or {}).get("market_data") or {}
+                    _explicit = bool(_raw_md.get("sentiment_enabled_set_by_user", False))
+                    if not _explicit and _raw_md.get("sentiment_enabled") is False:
+                        inst.market_data.sentiment_enabled = True
+                        inst.save(user_id)
+                        import logging
+                        logging.getLogger(__name__).info(
+                            "Sentiment Adjustment defaulted ON for existing settings "
+                            "(no explicit user preference recorded)"
+                        )
+                except Exception:
+                    # A migration failure must never prevent settings from
+                    # loading; the user keeps whatever the file said.
+                    pass
                 # One-time correction: the 200-bar default shipped briefly and
                 # was saved into existing settings files, where it blocks ALL
                 # warm-up because Quotex serves ~120. Changing the class

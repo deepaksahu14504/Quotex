@@ -454,14 +454,19 @@ def test_forming_candle_does_not_replace_closed_candle_evaluation():
 # 12. strategies behave identically with sentiment disabled
 # ────────────────────────────────────────────────────────────────────────────
 def test_strategy_output_is_identical_when_sentiment_is_disabled():
-    """The feature layer must be inert for the strategy engine by default.
+    """The feature layer must be inert for the strategy engine when disabled.
 
     `sentiment_confidence_adjustment` returns exactly 0.0 when disabled, so the
     confidence arithmetic is bit-for-bit what it was before this layer existed.
+
+    Sentiment now defaults to ON, so this test sets the flag explicitly rather
+    than relying on the class default -- the behaviour under test (a disabled
+    layer is inert) is unchanged by that default flip.
     """
     from app.config import RuntimeSettings
 
     rt = RuntimeSettings()
+    rt.market_data.sentiment_enabled = False
     assert rt.market_data.sentiment_enabled is False
 
     edf = strategies._enrich(candles_to_df(make_candles(240)))
@@ -789,17 +794,22 @@ async def test_collect_market_features_is_actually_wired(orch):
     )
     edf = strategies._enrich(candles_to_df(make_candles(200)))
 
+    # Sentiment now defaults to ON, so disable it explicitly first: the
+    # behaviour under test here is that a DISABLED layer makes no provider call
+    # and contributes exactly 0.0 -- not what the class default happens to be.
+    orch.runtime.market_data.sentiment_enabled = False
+
     feats, adj, _ev = await orch._collect_market_features(
         "EURUSD", "1m", edf, direction_value="CALL",
     )
     assert orch.provider.sentiment_calls == 0, (
-        "sentiment is disabled by default, so no provider call should be made"
+        "sentiment is disabled, so no provider call should be made"
     )
     assert orch.provider.tick_calls == 1, "tick activity is collected regardless"
     assert feats.asset == "EURUSD" and feats.timeframe == "1m"
     assert feats.sentiment.available is False
     assert feats.tick.tick_count == 6
-    # sentiment is DISABLED by default, so the nudge must be exactly 0.0.
+    # sentiment is DISABLED, so the nudge must be exactly 0.0.
     assert adj.adjustment == 0.0 and adj.reason == "disabled"
 
     # Now enable it: same provider, same data, bounded positive nudge.

@@ -1265,6 +1265,28 @@ class Orchestrator:
     def apply_settings(self, runtime: RuntimeSettings) -> None:
         prev_provider = self._provider_name()
         prev_demo = self.runtime.trading.is_demo
+        # ── Sentiment Adjustment: record an explicit user choice ─────────────
+        # The Settings UI PUTs the whole settings object, so the payload always
+        # carries `sentiment_enabled` whether or not the user touched it. The
+        # only reliable signal of intent is that the value actually CHANGED from
+        # the one in force. Capture it before `self.runtime = runtime` replaces
+        # the object, then mark the preference as explicit so load() stops
+        # migrating it -- from here on the user's choice (including OFF) is
+        # preserved across every restart.
+        try:
+            _prev_sent = bool(getattr(self.runtime.market_data, "sentiment_enabled", True))
+            _new_sent = bool(getattr(runtime.market_data, "sentiment_enabled", True))
+            if _new_sent != _prev_sent:
+                runtime.market_data.sentiment_enabled_set_by_user = True
+            else:
+                # Not a change: inherit whatever explicitness was already
+                # recorded, so a previously-explicit choice is never downgraded
+                # back to "migratable" by an unrelated settings save.
+                runtime.market_data.sentiment_enabled_set_by_user = bool(
+                    getattr(self.runtime.market_data, "sentiment_enabled_set_by_user", False)
+                )
+        except Exception:
+            pass
         self.runtime = runtime
         self.risk.settings = runtime.risk
         self.correlation_guard.threshold = runtime.risk.correlation_threshold
@@ -2294,7 +2316,10 @@ class Orchestrator:
                 report.add("malformed_tick")
 
         # ── sentiment (optional, bounded) ───────────────────────────────────
-        sent_enabled = bool(getattr(md, "sentiment_enabled", False))
+        # Fallback mirrors the MarketDataSettings default (ON). It only applies
+        # if the attribute is somehow absent, but a mismatched fallback would
+        # silently disable the feature for anyone hitting that path.
+        sent_enabled = bool(getattr(md, "sentiment_enabled", True))
         max_age = float(getattr(md, "sentiment_max_age_seconds", 120.0))
         if sent_enabled:
             try:

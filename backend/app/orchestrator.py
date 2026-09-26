@@ -24,6 +24,12 @@ from .engine.calibration import ConfidenceCalibrator
 from .engine.correlation import CorrelationGuard
 from .engine.decision_engine import build_decision, DecisionStore, compute_composite_confidence
 from .engine.rejection_reconciliation import RejectedOutcomeStore
+from .engine.session_recovery import (
+    RecoveryPolicy,
+    SessionEvent,
+    SessionRecoveryStateMachine,
+    SessionState,
+)
 from .engine.drift_detection import DriftDetector
 from .engine.confidence_model import ConfidenceModelStore, extract_features, build_training_set, FEATURE_NAMES
 from .engine.regime_transition_detector import RegimeTransitionEngine, TimeframeSignal
@@ -82,6 +88,14 @@ from .ws_hub import hub
 
 RECONNECT_BASE_DELAY = 2.0    # seconds — first retry after a Quotex disconnect
 RECONNECT_MAX_DELAY = 60.0    # seconds — backoff ceiling
+# Authentication-recovery budget. Deliberately separate from the transport
+# backoff above: a reconnect is cheap and worth retrying for a long time,
+# whereas a fresh sign-in hits the broker's login endpoint (and may trigger an
+# emailed OTP), so it must be capped hard. Exhausting it parks the system in
+# AUTH_EXHAUSTED with trading paused rather than looping.
+MAX_AUTH_ATTEMPTS = 3
+AUTH_BACKOFF_BASE_SECONDS = 5.0
+AUTH_BACKOFF_MAX_SECONDS = 300.0
 WATCHDOG_INTERVAL = 5.0       # seconds — how often we check connection health
 SIGNAL_RETENTION_SECONDS = 300  # keep terminal (expired/executed/rejected/skipped)
                                  # signals around for 5 min (UI history), then purge —
@@ -438,6 +452,20 @@ class Orchestrator:
         self._shadow_task: Optional[asyncio.Task] = None
         self._rejection_reconciliation_task: Optional[asyncio.Task] = None
         self._reconnecting = False
+        # Authentication lifecycle, tracked SEPARATELY from WebSocket
+        # connectivity. The broker can revoke a session while the socket stays
+        # perfectly open; previously that was indistinguishable from a network
+        # blip, so the reconnect loop re-sent the revoked token forever. This
+        # is the decision layer that tells the two apart.
+        self.session_recovery = SessionRecoveryStateMachine(
+            policy=RecoveryPolicy(
+                max_auth_attempts=MAX_AUTH_ATTEMPTS,
+                auth_backoff_base_seconds=AUTH_BACKOFF_BASE_SECONDS,
+                auth_backoff_max_seconds=AUTH_BACKOFF_MAX_SECONDS,
+            ),
+            on_transition=self._on_session_state_change,
+        )
+        self._session_recovery_task: Optional[asyncio.Task] = None
         # BUG FIX (startup race): the watchdog's reconnect trigger only ever
         # checked `_reconnecting` (set solely by _reconnect_with_backoff), not
         # whether the *initial* connect from start()/_connect_provider() was
@@ -1046,12 +1074,31 @@ class Orchestrator:
                 # provider swap, where self.provider is briefly the old,
                 # disconnected instance. All three must be checked; dropping
                 # any one of them reopens a distinct double-connect race.
+                # Authentication is observed FIRST, and separately from
+                # connectivity. A broker that revoked our session keeps the
+                # socket open, so `not provider.connected` alone can never
+                # notice it -- and reconnecting a revoked session just
+                # re-sends a token the broker already rejected.
+                self._observe_session_state()
+                self._maybe_start_session_recovery()
+
                 if (
                     not self.provider.connected
                     and not self._reconnecting
                     and not self._connect_in_progress
                     and not self._switching_provider
                     and not self.state.otp_required
+                    # Never start a transport reconnect while the auth path
+                    # owns the lifecycle -- the two would fight over
+                    # self.provider and self._client.
+                    and self.session_recovery.state not in (
+                        SessionState.SESSION_EXPIRED,
+                        SessionState.FRESH_SESSION_REQUIRED,
+                        SessionState.AUTHENTICATING,
+                        SessionState.NEW_SESSION_CREATED,
+                        SessionState.REAUTH_REQUIRED,
+                        SessionState.AUTH_EXHAUSTED,
+                    )
                 ):
                     self.state.stage = "reconnecting"
                     asyncio.create_task(self._reconnect_with_backoff())
@@ -1156,6 +1203,176 @@ class Orchestrator:
         finally:
             self._reconnecting = False
 
+    # ── authentication lifecycle (distinct from transport) ─────────────────
+    def _on_session_state_change(self, old: SessionState, new: SessionState,
+                                 reason: str) -> None:
+        """Mirror the session state machine into the published runtime state.
+
+        Kept side-effect-light and exception-safe: it runs inside the state
+        machine's transition, so it must never be able to break a transition.
+        """
+        try:
+            self.state.session_state = new.value
+            if new is SessionState.REAUTH_REQUIRED:
+                self.state.pause_reason = "Broker requires a new PIN/OTP to continue"
+            elif new is SessionState.AUTH_EXHAUSTED:
+                self.state.pause_reason = (
+                    "Session recovery exhausted its retry budget — re-login required"
+                )
+            elif new is SessionState.AUTHENTICATING:
+                self.state.pause_reason = "Authenticating a fresh broker session…"
+            elif new is SessionState.CONNECTED:
+                if self.state.pause_reason and "session" in self.state.pause_reason.lower():
+                    self.state.pause_reason = None
+        except Exception:
+            logger.debug("session state mirror failed", exc_info=True)
+
+    def _observe_session_state(self) -> None:
+        """Feed the broker's own auth verdict into the state machine.
+
+        Called from the watchdog. This is the piece that was missing entirely:
+        the vendor already reports AUTHENTICATED/FAILED, and nothing read it,
+        so a revoked session looked exactly like a network blip.
+        """
+        try:
+            probe = getattr(self.provider, "get_auth_status", None)
+            if probe is None:
+                # This provider does not expose the broker's auth verdict
+                # (Binance/Bybit deliver no equivalent signal). Connectivity is
+                # the best evidence available for it, and it is exactly what
+                # the system gated on before this mechanism existed -- so map
+                # it through rather than blocking the provider forever. The
+                # trade gate below keys off `trading_allowed`, which would
+                # otherwise never become True and would silently disable all
+                # trading on every non-Quotex provider.
+                if self.provider.connected:
+                    self.session_recovery.handle(SessionEvent.AUTH_CONFIRMED,
+                                                 "provider connected (no auth introspection)")
+                else:
+                    self.session_recovery.handle(SessionEvent.WS_DISCONNECTED,
+                                                 "provider disconnected")
+                return
+            status = probe()
+            if status == "authenticated":
+                self.session_recovery.handle(SessionEvent.AUTH_CONFIRMED,
+                                             "broker confirmed session")
+            elif status == "failed":
+                self.session_recovery.handle(SessionEvent.AUTH_REJECTED,
+                                             "broker rejected session")
+        except Exception as exc:
+            # An introspection failure must not be read as "still fine", but it
+            # also must not tear down the watchdog.
+            logger.debug("session observation failed: %s", type(exc).__name__)
+
+    def _maybe_start_session_recovery(self) -> None:
+        """Kick off re-authentication when the state machine asks for it."""
+        if not self.session_recovery.needs_fresh_session:
+            return
+        if self._session_recovery_task is not None and not self._session_recovery_task.done():
+            return                           # never two authentications at once
+        if self.state.otp_required:
+            return                           # a human is mid-OTP; do not race it
+        self._session_recovery_task = asyncio.create_task(self._recover_session())
+
+    async def _recover_session(self) -> None:
+        """Obtain a genuinely NEW authenticated session and resume.
+
+        Sequence: claim the single auth slot -> back off -> run the broker's
+        supported fresh sign-in -> reconnect -> wait for the broker to
+        positively confirm -> only then allow trading again.
+
+        The old session is never destroyed by this path; the new one has to be
+        confirmed first, so a failed attempt cannot leave us with nothing.
+        """
+        if not self.session_recovery.begin_auth_attempt():
+            # Either an attempt is already running or the budget is spent.
+            if self.session_recovery.is_exhausted:
+                self.state.paused = True
+                await self.broadcast_state()
+                await hub.broadcast(self.user_id, "notice", {
+                    "message": "Broker session expired and automatic re-login "
+                               "exhausted its retries — please sign in again"
+                })
+            return
+        attempt = self.session_recovery.auth_attempts
+        backoff = self.session_recovery.auth_backoff_seconds()
+        self.session_recovery.handle(SessionEvent.FRESH_SESSION_STARTED,
+                                     f"auth attempt {attempt}/{MAX_AUTH_ATTEMPTS}")
+        self.state.stage = "authenticating"
+        await self.broadcast_state()
+        logger.warning(
+            "[session-recovery] broker session expired; fresh authentication "
+            "attempt %d/%d after %.0fs backoff", attempt, MAX_AUTH_ATTEMPTS, backoff,
+        )
+        try:
+            await asyncio.sleep(backoff)
+        except asyncio.CancelledError:
+            return
+
+        refresh = getattr(self.provider, "refresh_session", None)
+        if refresh is None:
+            self.session_recovery.handle(SessionEvent.FRESH_SESSION_FAILED,
+                                         "provider has no refresh_session")
+            return
+        try:
+            ok = await refresh()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning("[session-recovery] fresh auth raised %s", type(exc).__name__)
+            ok = False
+
+        if not ok:
+            # refresh_session returns False both for a failed login and for
+            # "OTP was requested but no callback resolved it". Either way the
+            # broker has not given us a session.
+            if self.state.otp_required:
+                self.session_recovery.handle(SessionEvent.OTP_REQUIRED,
+                                             "broker requires a PIN")
+            else:
+                self.session_recovery.handle(SessionEvent.FRESH_SESSION_FAILED,
+                                             "fresh authentication failed")
+            await self.broadcast_state()
+            return
+
+        self.session_recovery.handle(SessionEvent.FRESH_SESSION_SUCCEEDED,
+                                     "new session obtained")
+        # Re-establish the authenticated WebSocket on the NEW session.
+        try:
+            connected = await self._connect_with_budget()
+        except Exception as exc:
+            logger.warning("[session-recovery] reconnect after fresh auth failed: %s",
+                           type(exc).__name__)
+            connected = False
+        if not connected:
+            self.session_recovery.handle(SessionEvent.FRESH_SESSION_FAILED,
+                                         "websocket reconnect after fresh auth failed")
+            await self.broadcast_state()
+            return
+
+        # Resume ONLY on positive confirmation. A socket that came up is not
+        # proof the broker accepted Session B.
+        self._observe_session_state()
+        if self.session_recovery.auth_confirmed:
+            self.state.connected = True
+            self.state.stage = "running"
+            self.state.pause_reason = None
+            self._reconnect_backoff = RECONNECT_BASE_DELAY
+            try:
+                bal, cur = await self.provider.get_balance()
+                self.state.balance = bal
+                self.state.currency = cur
+            except Exception as exc:
+                logger.warning("[session-recovery] balance refresh failed: %s",
+                               type(exc).__name__)
+            # Retire Session A only now that Session B is confirmed working.
+            await asyncio.to_thread(self._persist_broker_session)
+            asyncio.create_task(self.market_init.handle_reconnect())
+            await hub.broadcast(self.user_id, "notice", {
+                "message": "Broker session renewed — fresh session authenticated"
+            })
+        await self.broadcast_state()
+
     async def stop(self) -> None:
         self._running = False
         self._supervisor.stop()
@@ -1177,6 +1394,7 @@ class Orchestrator:
             t for t in (
                 self._scan_task, self._result_task, self._watchdog_task,
                 self._shadow_task, self._rejection_reconciliation_task,
+                self._session_recovery_task,
             ) if t
         ]
         for t in tasks:
@@ -3871,6 +4089,29 @@ class Orchestrator:
         single consumer for this user, so everything below is race-free —
         no other execution for this user can be interleaved with it."""
         self._last_execution_refusal = None
+        # AUTHENTICATION GATE. Previously the only precondition was
+        # `state.connected`, which is a WebSocket fact -- so after the broker
+        # revoked the session but left the socket open, this happily submitted
+        # orders that the broker would silently drop. Trading now requires a
+        # positive, still-fresh authentication confirmation.
+        if not self.session_recovery.trading_allowed:
+            self._last_execution_refusal = (
+                f"Authentication not confirmed (session_state="
+                f"{self.session_recovery.state.value}) — order refused"
+            )
+            logger.warning(
+                "[auth-gate] refusing execution for %s: %s",
+                signal_id, self._last_execution_refusal,
+            )
+            sig = self.signals.get(signal_id)
+            if sig is not None and sig.status in ("new", "approved"):
+                # `rejected` is already a terminal status for this model
+                # (_TERMINAL_SIGNAL_STATUSES) and `reasons` is the model's
+                # own free-form field -- Signal has no `reject_reason`
+                # attribute, so the reason is recorded there.
+                sig.status = "rejected"
+                sig.reasons.append(self._last_execution_refusal)
+            return None
         sig = self.signals.get(signal_id)
         if not sig or sig.status not in ("new", "approved"):
             self._last_execution_refusal = (

@@ -343,6 +343,16 @@ class EngineState(BaseModel):
     otp_required: bool = False
     otp_verifying: bool = False
     otp_message: Optional[str] = None
+    # Authentication lifecycle, tracked separately from `connected` (a
+    # point-in-time WebSocket flag). One of: stopped, connected,
+    # ws_disconnected, reconnecting, session_expired, fresh_session_required,
+    # authenticating, new_session_created, reauth_required, auth_exhausted.
+    # `connected` alone could not distinguish "socket up, session valid" from
+    # "socket up, session revoked" -- which is the difference between a cheap
+    # reconnect and needing a genuinely new login.
+    # Defaults to "stopped" so an existing deployment reading this field for
+    # the first time sees the same thing it did before the field existed.
+    session_state: str = "stopped"
     last_update: float = Field(default_factory=now_ts)
     # Account mode -- "live" | "demo" | "tournament". Distinct from `mode`
     # above, which is the trading mode (auto/manual/off). Defaults to

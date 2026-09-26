@@ -1021,6 +1021,98 @@ class PyQuotexProvider(MarketProvider):
                 self._tick_watcher_task = asyncio.create_task(self._tick_watcher())
         return self._connected
 
+    # ── authentication state (distinct from WebSocket connectivity) ────────
+    def get_auth_status(self) -> str:
+        """The broker's OWN authentication verdict for the current session.
+
+        Reads `client.api.state.auth_status`, which the vendor sets to FAILED
+        when the broker sends `authorization/reject` (api.py:432-441) and to
+        AUTHENTICATED when it sends `s_authorization` (api.py:442-451).
+
+        This is deliberately NOT `check_connect()`: that only reports
+        `state.status == CONNECTED` (api.py:1029), i.e. whether the socket is
+        up. A socket can be perfectly open while the session behind it has
+        been revoked -- which is exactly the case the reconnect loop used to
+        mistake for a transport blip and retry forever.
+
+        Returns one of: "authenticated" | "authenticating" |
+        "not_authenticated" | "failed" | "unknown".
+        """
+        try:
+            from pyquotex.global_value import AuthStatus
+
+            state = getattr(getattr(self._client, "api", None), "state", None)
+            if state is None:
+                return "unknown"
+            status = getattr(state, "auth_status", None)
+            if status is None:
+                return "unknown"
+            if status == AuthStatus.AUTHENTICATED:
+                return "authenticated"
+            if status == AuthStatus.AUTHENTICATING:
+                return "authenticating"
+            if status == AuthStatus.FAILED:
+                return "failed"
+            return "not_authenticated"
+        except Exception as exc:
+            # Never let an introspection failure be mistaken for "we're fine".
+            logger.debug("auth status introspection failed: %s", type(exc).__name__)
+            return "unknown"
+
+    def is_authenticated(self) -> bool:
+        """True only on a POSITIVE broker confirmation.
+
+        "unknown" is deliberately not True: when we cannot tell, the caller
+        must treat trading as unsafe rather than assume the session is good.
+        """
+        return self.get_auth_status() == "authenticated"
+
+    def session_expired(self) -> bool:
+        """True when the broker has explicitly rejected this session.
+
+        Distinguished from a mere socket drop so the orchestrator can choose
+        re-authentication instead of another pointless reconnect.
+        """
+        return self.get_auth_status() == "failed"
+
+    async def refresh_session(self) -> bool:
+        """Establish a genuinely NEW authenticated session (Session B).
+
+        Runs the broker's supported sign-in flow via the existing
+        `_seed_session_via_curlcffi`, which POSTs credentials to /sign-in/ and
+        -- if Quotex demands it -- completes OTP through `self._otp_callback`.
+        This broker's flow has no refresh-token endpoint, so a fresh sign-in is
+        the only supported way to obtain a new session; nothing here attempts
+        to bypass or automate around OTP.
+
+        The currently stored session is NOT destroyed by this method. On
+        success the login path has already written the new session.json; the
+        caller decides when to persist or retire the old one, so a failed
+        attempt can never leave us with no session at all.
+        """
+        sessions_dir = (
+            Path(self._sessions_dir_override)
+            if self._sessions_dir_override else Path.cwd()
+        )
+        logger.info("Attempting fresh Quotex authentication (new session)")
+        ok = await self._seed_session_via_curlcffi(sessions_dir, lang="en")
+        if not ok:
+            logger.warning("Fresh Quotex authentication did not produce a session")
+            return False
+        # Rebuild the client so it picks up the NEW session.json instead of
+        # holding the revoked credentials in memory.
+        try:
+            await self._client.close()
+        except Exception:
+            pass
+        try:
+            from pyquotex import Quotex
+            self._client = self._build_client(Quotex, sessions_dir)
+        except Exception as exc:
+            logger.warning("Could not rebuild client after fresh auth: %s", exc)
+            return False
+        return True
+
     #: Maximum number of (asset, period) candle caches held at once. Well
     #: above the ~36 a normal scan touches (12 assets x 3 timeframes), so
     #: eviction only ever affects assets that genuinely stopped being

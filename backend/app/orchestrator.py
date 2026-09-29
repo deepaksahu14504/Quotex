@@ -24,6 +24,7 @@ from .engine.calibration import ConfidenceCalibrator
 from .engine.correlation import CorrelationGuard
 from .engine.decision_engine import build_decision, DecisionStore, compute_composite_confidence
 from .engine.rejection_reconciliation import RejectedOutcomeStore
+from .broker_auth import QuotexAuthSessionManager, SessionBundle
 from .engine.session_recovery import (
     RecoveryPolicy,
     SessionEvent,
@@ -466,6 +467,19 @@ class Orchestrator:
             on_transition=self._on_session_state_change,
         )
         self._session_recovery_task: Optional[asyncio.Task] = None
+        # Single owner of this user's broker authentication lifecycle: load,
+        # validate, refresh, invalidate. Kept separate from `session_recovery`
+        # (which decides WHAT to do) -- this executes it, so there is exactly
+        # one place that talks to the broker about sessions.
+        self.auth_manager = QuotexAuthSessionManager(
+            self.user_id,
+            session_dir=Path(self._sessions_dir()),
+            persist=self._persist_auth_session,
+            load=self._load_auth_session,
+            fresh_login=self._fresh_auth_login,
+            auth_probe=self._probe_auth_status,
+            discard=self._discard_auth_session,
+        )
         # BUG FIX (startup race): the watchdog's reconnect trigger only ever
         # checked `_reconnecting` (set solely by _reconnect_with_backoff), not
         # whether the *initial* connect from start()/_connect_provider() was
@@ -606,6 +620,68 @@ class Orchestrator:
         ssid, cookies, user_agent = getter()
         if ssid:
             session_manager.save_session_token(self.user_id, ssid, cookies)
+
+    # ── delegates for QuotexAuthSessionManager ─────────────────────────────
+    # Thin adapters only: the manager owns the lifecycle and the events, these
+    # just reach the existing storage and provider. No login logic lives here,
+    # so there is nothing to drift out of sync with the manager.
+
+    def _persist_auth_session(self, ssid: str, cookies: Optional[str],
+                              user_agent: Optional[str]) -> None:
+        """Encrypt and store the session for THIS user only."""
+        session_manager.save_session_token(self.user_id, ssid, cookies)
+
+    def _load_auth_session(self) -> Optional[SessionBundle]:
+        """Return the persisted session for this user, or None.
+
+        Reads only this user's own encrypted row; never another account's.
+        """
+        info = session_manager.get_session_info(self.user_id)
+        creds = session_manager.get_credentials(self.user_id)
+        if info is None or not info.has_ssid:
+            return None
+        ssid = getattr(creds, "quotex_ssid", None) if creds else None
+        cookies = getattr(creds, "quotex_cookies", None) if creds else None
+        ua = getattr(creds, "quotex_user_agent", None) if creds else None
+        if not ssid:
+            return None
+        return SessionBundle(ssid=ssid, cookies=cookies, user_agent=ua)
+
+    async def _fresh_auth_login(self) -> bool:
+        """Run the broker's supported sign-in flow via the provider.
+
+        This is the ONE place a fresh login is triggered. It does not bypass
+        anything: if Quotex demands a PIN or an interactive browser challenge,
+        the provider surfaces that and this returns False.
+        """
+        refresh = getattr(self.provider, "refresh_session", None)
+        if refresh is None:
+            logger.warning("[auth] provider exposes no refresh_session; "
+                           "cannot establish a fresh session")
+            return False
+        return bool(await refresh())
+
+    def _probe_auth_status(self) -> str:
+        """The broker's own verdict on the current session."""
+        probe = getattr(self.provider, "get_auth_status", None)
+        if probe is None:
+            return "unknown"
+        return str(probe())
+
+    def _discard_auth_session(self) -> None:
+        """Wipe the stored session for THIS user only.
+
+        Called by the manager after the broker rejects a session. Both copies
+        must go: the on-disk file AND this encrypted row. Leaving the row
+        behind would let a restart resurrect a session the broker already
+        refused, which is exactly the failure mode being removed. Email and
+        password are kept -- only the session material is dropped.
+        """
+        try:
+            session_manager.clear_session_token(self.user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[auth] could not clear the stored session: %s",
+                           type(exc).__name__)
 
     @property
     def live_regime(self) -> Dict[str, str]:
@@ -1309,13 +1385,11 @@ class Orchestrator:
         except asyncio.CancelledError:
             return
 
-        refresh = getattr(self.provider, "refresh_session", None)
-        if refresh is None:
-            self.session_recovery.handle(SessionEvent.FRESH_SESSION_FAILED,
-                                         "provider has no refresh_session")
-            return
+        # All authentication goes through the auth manager -- never directly to
+        # the provider -- so there is one owner of the login lifecycle and no
+        # second copy of it to drift out of sync.
         try:
-            ok = await refresh()
+            ok = await self.auth_manager.create_fresh_session()
         except asyncio.CancelledError:
             return
         except Exception as exc:

@@ -35,6 +35,13 @@ from .engine.task_supervisor import TaskSupervisor, asyncio_task_count_monitor, 
 from .orchestrator import HTF_MAP, WATCHDOG_INTERVAL, Orchestrator
 from .orchestrator_registry import registry
 from .schemas import Candle, now_ts
+from .services.chart_service import (
+    CHART_TIMEFRAMES,
+    DEFAULT_CANDLE_LIMIT,
+    build_chart_payload,
+    clamp_limit,
+    normalize_timeframe,
+)
 from .session_manager import session_manager
 from .ws_hub import hub
 
@@ -676,6 +683,61 @@ async def get_assets(o: Orchestrator = Depends(get_orch)):
 async def get_candles(asset: str, timeframe: str = "1m", count: int = 120, o: Orchestrator = Depends(get_orch)):
     candles = await o.provider.get_candles(asset, timeframe, count)
     return [c.model_dump() for c in candles]
+
+
+@app.get("/api/chart/candles")
+async def get_chart_candles(
+    asset: str,
+    timeframe: str = "1m",
+    limit: int = DEFAULT_CANDLE_LIMIT,
+    o: Orchestrator = Depends(get_orch),
+):
+    """Historical candles for the market chart.
+
+    Reads through the same provider the trading pipeline uses, so the chart and
+    the engine are always looking at one source of truth. Adds only what the
+    chart needs on top: UI timeframe labels translated to the model's keys,
+    invalid candles rejected rather than drawn, and volume reported as null
+    when it is a tick-count proxy rather than real volume.
+
+    The response carries OHLC only -- no credentials, session material or auth
+    state. /api/candles is left untouched for its existing callers.
+    """
+    tf = normalize_timeframe(timeframe)
+    if tf is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unsupported timeframe {timeframe!r}; "
+                   f"expected one of {', '.join(CHART_TIMEFRAMES)}",
+        )
+    count = clamp_limit(limit)
+    try:
+        candles = await o.provider.get_candles(asset, tf, count)
+    except Exception as exc:
+        # Surface a real state to the UI instead of an empty chart that looks
+        # like "no trades yet".
+        logger.warning("chart: candle fetch failed for %s %s: %s",
+                       asset, tf, type(exc).__name__)
+        raise HTTPException(status_code=502, detail="market data unavailable")
+    return build_chart_payload(asset, tf, candles, limit=count)
+
+
+@app.get("/api/chart/meta")
+async def get_chart_meta(o: Orchestrator = Depends(get_orch)):
+    """The timeframes the chart offers, and the assets it may show.
+
+    Assets come from the provider, so the chart never needs its own hardcoded
+    list and cannot drift from the trading engine's universe.
+    """
+    try:
+        assets = await o.provider.get_assets()
+    except Exception as exc:
+        logger.warning("chart: asset list unavailable: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="asset list unavailable")
+    return {
+        "timeframes": CHART_TIMEFRAMES,
+        "assets": [a.model_dump() for a in assets],
+    }
 
 
 @app.get("/api/scan-telemetry")

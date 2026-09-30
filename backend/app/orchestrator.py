@@ -479,6 +479,7 @@ class Orchestrator:
             fresh_login=self._fresh_auth_login,
             auth_probe=self._probe_auth_status,
             discard=self._discard_auth_session,
+            on_event=self._on_auth_event,
         )
         # BUG FIX (startup race): the watchdog's reconnect trigger only ever
         # checked `_reconnecting` (set solely by _reconnect_with_backoff), not
@@ -694,6 +695,70 @@ class Orchestrator:
         if probe is None:
             return "unknown"
         return str(probe())
+
+    # Auth events that mean something changed and the user should see it.
+    # AUTH_SESSION_LOAD fires on every validation, so it is logged at debug
+    # and never pushed to the UI.
+    _AUTH_UI_EVENTS = frozenset({
+        "AUTH_SESSION_VALID", "AUTH_SESSION_EXPIRED", "AUTH_SESSION_INVALID",
+        "AUTH_FRESH_SESSION_REQUIRED", "AUTH_FRESH_SESSION_STARTED",
+        "AUTH_FRESH_SESSION_SUCCEEDED", "AUTH_FRESH_SESSION_FAILED",
+        "AUTH_BROWSER_REQUIRED", "AUTH_OTP_REQUIRED",
+        "AUTH_SESSION_INVALIDATED", "AUTH_RECONNECT_SUCCESS",
+        "AUTH_RECONNECT_FAILED",
+    })
+    # Keys that must never reach a log line or a websocket frame, even if a
+    # future payload grows one. Defence in depth on top of the manager, which
+    # already emits lengths rather than values.
+    _AUTH_SECRET_KEYS = frozenset({
+        "ssid", "cookies", "cookie", "token", "password", "authorization",
+        "auth_header", "secret", "session", "session_data",
+    })
+    _AUTH_FAILURE_EVENTS = frozenset({
+        "AUTH_SESSION_EXPIRED", "AUTH_SESSION_INVALID",
+        "AUTH_FRESH_SESSION_FAILED", "AUTH_BROWSER_REQUIRED",
+        "AUTH_RECONNECT_FAILED",
+    })
+
+    def _scrub_auth_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip anything that could be a credential before it leaves here."""
+        clean: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if key.lower() in self._AUTH_SECRET_KEYS:
+                # Report the length, never the value.
+                clean[f"{key}_len"] = len(value) if isinstance(value, str) else 0
+            else:
+                clean[key] = value
+        return clean
+
+    def _on_auth_event(self, name: str, **payload: Any) -> None:
+        """Emit an auth lifecycle event to the log and, when relevant, the UI.
+
+        Synchronous because the manager emits from sync methods too; the
+        websocket broadcast is scheduled onto the running loop rather than
+        awaited, so a sync caller is never blocked or broken.
+        """
+        clean = self._scrub_auth_payload(payload)
+        reason = clean.get("reason", "")
+
+        # Log every event; keep the high-frequency one quiet.
+        if name == "AUTH_SESSION_LOAD":
+            logger.debug("[auth] %s user=%s found=%s", name, self.user_id,
+                         clean.get("found"))
+        else:
+            log = logger.warning if name in self._AUTH_FAILURE_EVENTS else logger.info
+            log("[auth] %s user=%s %s", name, self.user_id,
+                f"({reason})" if reason else "")
+
+        if name not in self._AUTH_UI_EVENTS:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # no loop: the log line above is still the record
+        loop.create_task(
+            hub.broadcast(self.user_id, "auth_event", {"event": name, **clean})
+        )
 
     def _discard_auth_session(self) -> None:
         """Wipe the stored session for THIS user only.

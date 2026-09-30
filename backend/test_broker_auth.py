@@ -774,3 +774,117 @@ def test_provider_block_reason_reaches_the_probe():
     stub = SimpleNamespace(state=SimpleNamespace(otp_required=False),
                            provider=SimpleNamespace(get_auth_status=lambda: "failed"))
     assert orch.Orchestrator._probe_auth_status(stub) == "failed"
+
+
+# ── structured events actually leave the manager (item 11) ─────────────────
+#
+# The manager emitted 14 AUTH_* events but the orchestrator passed no on_event,
+# so every one of them died in an in-memory ring: nothing reached the log and
+# nothing reached the UI. These tests call the REAL handler.
+
+def _auth_stub(monkeypatch, orch, logged, sent):
+    """A stub carrying exactly what _on_auth_event touches."""
+    class Spy:
+        def __getattr__(self, lvl):
+            return lambda msg, *a, **k: logged.append(
+                (lvl, msg % a if a else msg))
+
+    class Hub:
+        async def broadcast(self, uid, ev, data):
+            sent.append((uid, ev, data))
+
+    monkeypatch.setattr(orch, "logger", Spy())
+    monkeypatch.setattr(orch, "hub", Hub())
+    stub = SimpleNamespace(
+        user_id="u1", logger=orch.logger,
+        _AUTH_SECRET_KEYS=orch.Orchestrator._AUTH_SECRET_KEYS,
+        _AUTH_UI_EVENTS=orch.Orchestrator._AUTH_UI_EVENTS,
+        _AUTH_FAILURE_EVENTS=orch.Orchestrator._AUTH_FAILURE_EVENTS,
+    )
+    stub._scrub_auth_payload = (
+        lambda payload: orch.Orchestrator._scrub_auth_payload(stub, payload))
+    return stub
+
+
+def test_secret_keys_are_replaced_by_lengths():
+    import app.orchestrator as orch
+    import json as _json
+
+    logged, sent = [], []
+    # no monkeypatch fixture needed: the scrub touches no module globals
+    class _NoLog:
+        def __getattr__(self, _): return lambda *a, **k: None
+    stub = SimpleNamespace(
+        user_id="u1", logger=_NoLog(),
+        _AUTH_SECRET_KEYS=orch.Orchestrator._AUTH_SECRET_KEYS,
+        _AUTH_UI_EVENTS=orch.Orchestrator._AUTH_UI_EVENTS,
+        _AUTH_FAILURE_EVENTS=orch.Orchestrator._AUTH_FAILURE_EVENTS,
+    )
+    stub._scrub_auth_payload = (
+        lambda payload: orch.Orchestrator._scrub_auth_payload(stub, payload))
+
+    clean = orch.Orchestrator._scrub_auth_payload(stub, {
+        "ssid": "SUPER-SECRET-SSID", "cookies": "ssid=SUPERSECRET",
+        "token": "T0KEN", "password": "hunter2", "reason": "ok",
+    })
+
+    blob = _json.dumps(clean, default=str)
+    for leak in ("SUPER-SECRET-SSID", "SUPERSECRET", "T0KEN", "hunter2"):
+        assert leak not in blob, f"secret leaked: {leak}"
+    assert clean["ssid_len"] == len("SUPER-SECRET-SSID")
+    assert clean["reason"] == "ok", "non-secret fields must survive"
+
+
+@pytest.mark.asyncio
+async def test_events_are_logged_and_broadcast(monkeypatch):
+    import app.orchestrator as orch
+
+    logged, sent = [], []
+    stub = _auth_stub(monkeypatch, orch, logged, sent)
+
+    orch.Orchestrator._on_auth_event(stub, "AUTH_SESSION_VALID",
+                                     reason="broker confirmed", ssid_len=15)
+    orch.Orchestrator._on_auth_event(stub, "AUTH_BROWSER_REQUIRED",
+                                     reason="interactive challenge")
+    orch.Orchestrator._on_auth_event(stub, "AUTH_SESSION_LOAD", found=True)
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+    assert any("AUTH_SESSION_VALID" in m for _, m in logged)
+    assert any("AUTH_BROWSER_REQUIRED" in m for _, m in logged)
+
+    levels = {m.split()[1]: lvl for lvl, m in logged
+              if m.startswith("[auth] AUTH_")}
+    assert levels["AUTH_SESSION_VALID"] == "info"
+    assert levels["AUTH_BROWSER_REQUIRED"] == "warning", \
+        "a failure-class event must log at warning"
+    assert levels["AUTH_SESSION_LOAD"] == "debug", \
+        "the high-frequency event must stay quiet"
+
+    pushed = {d["event"] for _, _, d in sent}
+    assert pushed == {"AUTH_SESSION_VALID", "AUTH_BROWSER_REQUIRED"}
+    assert "AUTH_SESSION_LOAD" not in pushed, \
+        "it fires on every validation; it must not reach the UI"
+
+
+def test_event_handler_is_safe_with_no_running_loop(monkeypatch):
+    import app.orchestrator as orch
+
+    logged, sent = [], []
+    stub = _auth_stub(monkeypatch, orch, logged, sent)
+
+    # called outside any event loop: must log, must not raise
+    orch.Orchestrator._on_auth_event(stub, "AUTH_RECONNECT_FAILED", reason="x")
+
+    assert len(logged) == 1
+    assert sent == []
+
+
+def test_orchestrator_actually_wires_on_event():
+    """Guard against the regression: a manager with no event sink."""
+    import inspect
+    import app.orchestrator as orch
+
+    src = inspect.getsource(orch.Orchestrator.__init__)
+    assert "on_event=self._on_auth_event" in src, \
+        "events would be trapped inside the manager again"

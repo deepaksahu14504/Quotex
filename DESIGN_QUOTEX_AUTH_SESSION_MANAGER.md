@@ -20,7 +20,7 @@ There is no `src/` directory at all. The equivalents are:
 | `…/vendor/pyquotex/ws/client.py` | `vendor/old-pyquotex/pyquotex/ws/client.py` |
 | `…/vendor/pyquotex/ws/channels/ssid.py` | `vendor/old-pyquotex/pyquotex/ws/channels/ssid.py` |
 
-**(b) A browser cannot be driven in this environment.**
+**(b) No browser is drivable here — but the repo does not need one.**
 
 Verified, not assumed:
 - no browser binary on `PATH` (`google-chrome`, `chromium`, `firefox` — none)
@@ -28,8 +28,22 @@ Verified, not assumed:
 - no browser-automation library in any of the three requirements files
   (`playwright`, `selenium`, `pyppeteer`, `DrissionPage` — none present)
 
-So item 2's "browser-based initial authentication" **cannot be exercised or
-tested here**. See §6 for what I propose instead, and why I will not fake it.
+**Correction to an earlier draft of this report:** I originally presented this
+as "browser-based initial authentication cannot be exercised here", implying
+item 2's browser-compatible bootstrap was missing. That was misleading. The
+repo already obtains a browser-compatible session **without driving a
+browser**, and has done so before this task:
+
+| What the task asked for | What the repo actually does | Where |
+| --- | --- | --- |
+| Browser-compatible bootstrap | `curl_cffi` session with TLS/JA3 fingerprint impersonation of Firefox 133 | `market.py:603` `_CF_IMPERSONATE = "firefox133"` → `:801` `requests.Session(impersonate=self._CF_IMPERSONATE)` |
+| 2FA / emailed PIN | Detects Quotex's own `name="keep_code"` field, calls `_otp_callback`, submits the human-entered code to `/sign-in/modal` | `market.py:808-816`; `orchestrator._otp_callback` broadcasts `otp_required` to the UI and waits 300 s |
+| Acquire + persist the session token | Writes `session.json`, then the manager persists it per user | `_seed_session_via_curlcffi`; `QuotexAuthSessionManager.save_session` |
+
+So item 2 is satisfied by the **existing** credential + OTP flow, which the
+manager now owns rather than replaces. A drivable headed browser remains
+unnecessary for the supported path; see §6 for the one case where it would
+still matter.
 
 ---
 
@@ -145,18 +159,23 @@ Structured events (item 11): `AUTH_SESSION_LOAD`, `AUTH_SESSION_VALID`,
 `AUTH_SESSION_SAVED`, `AUTH_RECONNECT_SUCCESS`, `AUTH_RECONNECT_FAILED` — via the
 existing `log_event()` helper, carrying lengths/booleans only, never values.
 
-## 6. The honest problem with item 2, and what I propose
+## 6. Where a real browser would still matter, and what I propose
 
-Item 2 asks for browser automation so a human can complete Cloudflare
-legitimately. That is a sound design and I am **not** going to bypass Cloudflare
-to avoid it. But:
+Item 2 asks for browser-based login so a human can complete an interactive
+challenge legitimately. **For the normal path this repo does not need one:**
+the supported credential + emailed-PIN flow already produces a browser-
+compatible session headlessly (§1(b)). Nothing below changes that.
+
+A headed browser would matter in exactly one situation: when Quotex serves an
+interactive Cloudflare challenge that the credential flow cannot satisfy —
+i.e. when the manager has emitted `AUTH_BROWSER_REQUIRED`. Then:
 
 - this environment has no browser binary, no `DISPLAY`, and no automation
-  library;
+  library, so that path cannot be exercised or tested here;
 - the app is a headless multi-user server, so "a human completes the challenge
   in a browser" needs a place for that browser to exist.
 
-Three honest options:
+Three honest options for that remaining case:
 
 1. **Build the manager now with a pluggable browser hook, defaulting to the
    existing HTTP sign-in flow.** `create_fresh_session()` tries the supported
@@ -176,8 +195,20 @@ accept that it ships untested here.
 
 ## 7. What I will NOT do
 
-- No Cloudflare bypass, no CAPTCHA solving, no stealth fingerprint spoofing,
-  no challenge-token extraction (items: IMPORTANT, 8).
+- **I added** no Cloudflare bypass, no CAPTCHA solving, no new fingerprint
+  spoofing and no challenge-token extraction (items: IMPORTANT, 8).
+- To be precise about the existing system rather than only about my diff:
+  `market.py:603` already sets `_CF_IMPERSONATE = "firefox133"`, and
+  `curl_cffi`'s `impersonate=` is TLS/JA3 fingerprint impersonation. That is
+  pre-existing and this task neither introduced nor removed it. What I will not
+  do is **extend or tune it as an evasion mechanism** — e.g. automating the
+  `vendor/old-pyquotex/scripts/seed_session_via_curlcffi.py:57` suggestion to
+  "try a different impersonate value" when Cloudflare blocks. Rotating
+  impersonation profiles until a block clears is circumvention, not
+  compatibility, and it stays out.
+- If the broker demands a challenge that impersonation does not satisfy, the
+  manager emits `AUTH_BROWSER_REQUIRED` and stops for a human. It does not
+  escalate.
 - No second login implementation alongside `_seed_session_via_curlcffi`.
 - No change to strategy generation, confidence, risk, signals, candle
   aggregation, or trade-execution rules (item 13).

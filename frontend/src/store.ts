@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { api, setUnauthorizedHandler } from "./api";
 import { getStoredUser, getToken, login as loginApi, logout as logoutApi, register as registerApi, type AuthUser } from "./auth";
 import { sound } from "./sound";
+import { publishCandleUpdate } from "./chart/candleBus";
 import type { AnalyticsUpdate, AssetPipelineSnapshot, EngineState, PipelineStageMetric, RuntimeSettings, Signal, Trade } from "./types";
 
 interface Toast {
@@ -64,6 +65,40 @@ let wsRetryDelay = WS_BASE_DELAY;
 let wsRetryTimer: ReturnType<typeof setTimeout> | null = null;
 let wsPingTimer: ReturnType<typeof setInterval> | null = null;
 let wsGeneration = 0; // bumps on logout/manual disconnect so stale reconnect attempts no-op
+
+/**
+ * Send a control message on the live socket.
+ *
+ * Returns false when there is no open connection, so callers can retry after
+ * reconnecting instead of throwing into a websocket onmessage/onopen handler.
+ */
+export function sendWS(payload: Record<string, unknown>): boolean {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    ws.send(JSON.stringify(payload));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The chart's live subscriptions, kept here so a reconnect can re-ask for
+ * them. The server drops all subscriptions when a socket closes, so without
+ * this the chart would silently stop updating after any network blip -- the
+ * exact "reconnect and resync without a page reload" case.
+ */
+const chartWatches = new Set<string>();
+
+export function watchChart(asset: string, timeframe: string): void {
+  chartWatches.add(`${asset}|${timeframe}`);
+  sendWS({ event: "chart_subscribe", asset, timeframe });
+}
+
+export function unwatchChart(asset: string, timeframe: string): void {
+  chartWatches.delete(`${asset}|${timeframe}`);
+  sendWS({ event: "chart_unsubscribe", asset, timeframe });
+}
 
 function teardownWS() {
   wsGeneration++;
@@ -170,6 +205,17 @@ export const useStore = create<AppState>((set, get) => ({
       socket.onopen = () => {
         wsRetryDelay = WS_BASE_DELAY; // reset backoff on a healthy connection
         set({ wsConnected: true });
+        // The server cleared this connection's chart subscriptions when the
+        // old socket closed, so re-ask for whatever the chart still wants.
+        for (const key of chartWatches) {
+          const sep = key.lastIndexOf("|");
+          if (sep <= 0) continue;
+          sendWS({
+            event: "chart_subscribe",
+            asset: key.slice(0, sep),
+            timeframe: key.slice(sep + 1),
+          });
+        }
         wsPingTimer = setInterval(() => {
           try {
             socket.send(JSON.stringify({ event: "ping" }));
@@ -305,6 +351,13 @@ export const useStore = create<AppState>((set, get) => ({
           }
           case "analytics_update":
             set({ analytics: data as AnalyticsUpdate });
+            break;
+          case "candle_update":
+            // Deliberately NOT stored in the zustand state. A frame arrives
+            // several times a second and only the chart cares about it; going
+            // through the store would re-evaluate every dashboard consumer on
+            // each tick. The bus hands it straight to the chart series.
+            publishCandleUpdate(data as Record<string, unknown>);
             break;
         }
       };

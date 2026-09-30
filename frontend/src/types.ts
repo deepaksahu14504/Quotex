@@ -86,6 +86,43 @@ export interface Candle {
   volume: number;
 }
 
+/**
+ * Chart candle envelope from /api/chart/candles.
+ *
+ * Deliberately NOT the legacy `Candle` above: its `volume` is a plain number,
+ * whereas the chart endpoint reports `null` when the provider's volume is a
+ * tick-count proxy rather than real order activity. Typing that as a number
+ * would let a tick count be rendered as a volume figure.
+ */
+export interface ChartCandleDTO {
+  timestamp: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | null;
+}
+
+export interface ChartCandlesResponse {
+  asset: string;
+  timeframe: string;
+  candles: ChartCandleDTO[];
+  /** How many raw candles the server dropped as malformed. */
+  rejected: number;
+}
+
+export interface ChartMetaResponse {
+  timeframes: string[];
+  assets: AssetInfo[];
+}
+
+export interface ChartTimeframeOption {
+  /** Value sent to the API. */
+  value: string;
+  /** Short label shown in the toolbar. */
+  label: string;
+}
+
 export interface RuntimeSettings {
   provider?: "paper" | "pyquotex" | null;
   trading: {

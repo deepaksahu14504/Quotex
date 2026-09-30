@@ -1,4 +1,4 @@
-import type { AssetInfo, AssetPipelineSnapshot, BacktestRequest, BacktestResult, CalibrationStatus, Candle, DriftStatus, EnvSettings, Insights, PipelineHealth, PipelineReplayResponse, PipelineRestartResult, PipelineTraceDetail, RegimePerformance, RejectionReport, RuntimeSettings, Signal, Stats, StrategyPerformance, SystemStatus, Trade, EngineState, ValidationHealthRow, ValidationLeaderboard, ValidationProgress, SettingsAdvice, TelegramStatus } from "./types";
+import type { AssetInfo, AssetPipelineSnapshot, ChartCandlesResponse, ChartMetaResponse, BacktestRequest, BacktestResult, CalibrationStatus, Candle, DriftStatus, EnvSettings, Insights, PipelineHealth, PipelineReplayResponse, PipelineRestartResult, PipelineTraceDetail, RegimePerformance, RejectionReport, RuntimeSettings, Signal, Stats, StrategyPerformance, SystemStatus, Trade, EngineState, ValidationHealthRow, ValidationLeaderboard, ValidationProgress, SettingsAdvice, TelegramStatus } from "./types";
 import { authHeaders, clearSession } from "./auth";
 
 // Set by store.ts on init so a 401 from any API call (expired/invalid token)
@@ -72,6 +72,18 @@ export const api = {
   assets: () => get<AssetInfo[]>("/api/assets"),
   candles: (asset: string, tf: string, count = 120) =>
     get<Candle[]>(`/api/candles?asset=${encodeURIComponent(asset)}&timeframe=${tf}&count=${count}`),
+
+  /**
+   * Candles for the market chart. Distinct from `candles()` above, which
+   * returns a bare list and keeps `volume_source`; this returns an envelope
+   * with a rejection count, and reports volume as null when the provider's
+   * figure is a tick-count proxy rather than real order activity.
+   */
+  chartCandles: (asset: string, tf: string, limit = 300) =>
+    get<ChartCandlesResponse>(`/api/chart/candles?asset=${encodeURIComponent(asset)}&timeframe=${encodeURIComponent(tf)}&limit=${limit}`),
+
+  /** Timeframes and the asset list the chart may offer, from the server. */
+  chartMeta: () => get<ChartMetaResponse>("/api/chart/meta"),
   signals: () => get<Signal[]>("/api/signals"),
   trades: (limit = 100) => get<Trade[]>(`/api/trades?limit=${limit}`),
   deleteTrade: (id: string) => send(`/api/trades/${id}`, "DELETE"),

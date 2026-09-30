@@ -289,9 +289,15 @@ class QuotexAuthSessionManager:
 
         A missing, unreadable or corrupt file is treated as "no session" --
         never as a crash, and never as proof the session is valid.
+
+        Precedence: when a durable store is configured it is authoritative.
+        The on-disk file is the storage only when no store was supplied, so a
+        store that has deliberately forgotten a session cannot be overridden by
+        a leftover file.
         """
         bundle: Optional[SessionBundle] = None
-        if self._load is not None:
+        store_authoritative = self._load is not None
+        if store_authoritative:
             try:
                 bundle = self._load()
             except Exception as exc:  # noqa: BLE001
@@ -299,7 +305,20 @@ class QuotexAuthSessionManager:
                                self.user_id, type(exc).__name__)
                 bundle = None
         if bundle is None and self.session_path is not None:
-            bundle = self._read_file()
+            if store_authoritative:
+                # A configured store is the authority. When it says there is no
+                # session, an on-disk copy is stale by definition -- so it is
+                # removed, not resurrected.
+                #
+                # Concretely: updating credentials in the UI calls
+                # clear_session_token(), which NULLs the stored ssid/cookies so
+                # that new credentials always mean a genuinely fresh login. If
+                # this file were trusted after that, the previous account's
+                # session would come straight back.
+                self._remove_file()
+            else:
+                # No durable store configured: the file IS the storage.
+                bundle = self._read_file()
         if bundle is not None and not bundle.is_usable():
             logger.debug("[auth] stored session for user=%s is incomplete; "
                          "treating as absent", self.user_id)

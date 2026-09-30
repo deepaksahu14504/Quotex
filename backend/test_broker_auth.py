@@ -327,11 +327,16 @@ async def test_inconclusive_validation_never_discards_the_session(tmp_path):
 @pytest.mark.asyncio
 async def test_restart_reuses_the_session_written_by_the_previous_run(tmp_path):
     """Crash recovery: load -> validate -> reuse. The file alone proves nothing."""
-    manager_a, store, _ = make_manager(tmp_path, "u1", status="authenticated")
+    # One durable store shared across both instances: a real restart loses the
+    # manager object but NOT the encrypted broker_sessions row.
+    store = FakeStorage()
+    manager_a, _s1, _ = make_manager(tmp_path, "u1", status="authenticated",
+                                     storage=store)
     await manager_a.save_session("persisted-ssid", "cookie=1", "UA/1.0")
 
-    # Simulate a process restart: a brand new manager instance.
-    manager_b, _store2, calls = make_manager(tmp_path, "u1", status="authenticated")
+    # Simulate a process restart: a brand new manager instance, same store.
+    manager_b, _store2, calls = make_manager(tmp_path, "u1", status="authenticated",
+                                             storage=store)
 
     result = await manager_b.validate_session()
 
@@ -342,20 +347,22 @@ async def test_restart_reuses_the_session_written_by_the_previous_run(tmp_path):
 
 @pytest.mark.asyncio
 async def test_restart_does_not_trust_the_file_when_the_broker_rejects_it(tmp_path):
-    manager_a, store, _ = make_manager(tmp_path, "u1", status="authenticated")
+    store = FakeStorage()
+    manager_a, _s1, _ = make_manager(tmp_path, "u1", status="authenticated",
+                                     storage=store)
     await manager_a.save_session("persisted-ssid", "cookie=1", "UA/1.0")
 
     # Restart, but the broker has since killed the session.
     manager_b, _s2, calls = make_manager(tmp_path, "u1",
                                          status=["failed", "failed",
-                                                 "authenticated"])
+                                                 "authenticated"],
+                                         storage=store)
     result = await manager_b.validate_session()
     assert result.valid is False
 
     assert await manager_b.reconnect_session() is True
     assert calls["login"] == 1
-    # manager_b owns its own store; manager_a's copy is a different object
-    assert _s2.rows["u1"]["ssid"] == "ssid-1"
+    assert store.rows["u1"]["ssid"] == "ssid-1", "the dead session was replaced"
     # and the on-disk file (shared, per-user) was replaced too
     assert manager_b.load_session().ssid == "ssid-1"
 
@@ -888,3 +895,68 @@ def test_orchestrator_actually_wires_on_event():
     src = inspect.getsource(orch.Orchestrator.__init__)
     assert "on_event=self._on_auth_event" in src, \
         "events would be trapped inside the manager again"
+
+
+# ── a cleared store must not be overridden by a leftover file (item 10) ────
+#
+# load_session used to fall back to the on-disk file whenever the durable store
+# returned nothing. Updating credentials in the UI calls clear_session_token(),
+# which NULLs the stored ssid/cookies precisely so that new credentials mean a
+# genuinely fresh login -- but the file survived, so the previous session came
+# straight back.
+
+@pytest.mark.asyncio
+async def test_cleared_store_is_not_overridden_by_a_leftover_file(tmp_path):
+    store = FakeStorage()
+    d = tmp_path / "u1"
+    manager = QuotexAuthSessionManager(
+        "u1", session_dir=d,
+        persist=lambda ssid, ck, ua: store.persist("u1", ssid, ck, ua),
+        load=lambda: store.load("u1"),
+        discard=lambda: store.discard("u1"),
+        auth_probe=lambda: "authenticated",
+    )
+    await manager.save_session("old-ssid", "cookie=1", "UA/1.0")
+    assert manager.session_path.exists(), "precondition: both copies exist"
+
+    # The user changes credentials; the store forgets the session on purpose.
+    store.discard("u1")
+
+    assert manager.load_session() is None, "a cleared store must mean no session"
+    assert not manager.session_path.exists(), "the stale file must be removed"
+    assert manager.can_trade is False
+
+
+@pytest.mark.asyncio
+async def test_file_is_the_storage_when_no_store_is_configured(tmp_path):
+    """Without a durable store the file IS the storage -- the corrupt-file and
+    restart tests depend on that, and this fix must not break it."""
+    d = tmp_path / "fileonly"
+    manager = QuotexAuthSessionManager("u1", session_dir=d)
+    await manager.save_session("file-ssid", "cookie=1", "UA/1.0")
+
+    # a brand new instance must still find it
+    reopened = QuotexAuthSessionManager("u1", session_dir=d)
+    bundle = reopened.load_session()
+    assert bundle is not None and bundle.ssid == "file-ssid"
+
+
+@pytest.mark.asyncio
+async def test_store_still_wins_over_the_file_when_both_exist(tmp_path):
+    store = FakeStorage()
+    d = tmp_path / "both"
+    manager = QuotexAuthSessionManager(
+        "u1", session_dir=d,
+        persist=lambda ssid, ck, ua: store.persist("u1", ssid, ck, ua),
+        load=lambda: store.load("u1"),
+        auth_probe=lambda: "authenticated",
+    )
+    await manager.save_session("store-ssid", "cookie=1", "UA/1.0")
+
+    # a stale file must never shadow the store's answer
+    (d / "quotex_session.json").write_text(
+        json.dumps({"ssid": "stale-file-ssid", "cookies": "c=1"}), encoding="utf-8")
+
+    bundle = manager.load_session()
+    assert bundle is not None
+    assert bundle.ssid == "store-ssid", "the store is authoritative"

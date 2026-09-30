@@ -1685,16 +1685,45 @@ async def ws_endpoint(ws: WebSocket):
             # answer it so the client's own liveness check is satisfied.
             try:
                 msg = json.loads(raw)
-                if msg.get("event") == "ping":
-                    await ws.send_json({"event": "pong", "data": {}})
             except Exception:
-                pass
+                continue
+            try:
+                event = msg.get("event")
+                if event == "ping":
+                    await ws.send_json({"event": "pong", "data": {}})
+                elif event == "chart_subscribe":
+                    # The chart asks for live candles on this same connection:
+                    # no second websocket, no polling timer, and no new
+                    # connection to the broker. One loop per (asset,
+                    # timeframe) is shared by every tab that asks for it.
+                    asset = msg.get("asset")
+                    timeframe = msg.get("timeframe")
+                    if asset and timeframe:
+                        ok = await o.subscribe_chart(str(asset), str(timeframe))
+                        await ws.send_json({"event": "chart_subscribed", "data": {
+                            "asset": asset, "timeframe": timeframe, "ok": ok,
+                        }})
+                elif event == "chart_unsubscribe":
+                    asset = msg.get("asset")
+                    timeframe = msg.get("timeframe")
+                    if asset and timeframe:
+                        await o.unsubscribe_chart(str(asset), str(timeframe))
+            except Exception as exc:
+                logger.debug("[ws] chart control message failed: %s",
+                             type(exc).__name__)
     except WebSocketDisconnect:
         pass
     except Exception:
         pass
     finally:
         hb_task.cancel()
+        # Drop this connection's chart subscriptions, otherwise a closed tab
+        # would keep a candle loop running for nobody.
+        try:
+            await o.chart_streamer.unsubscribe_all()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[ws] chart unsubscribe on close failed: %s",
+                         type(exc).__name__)
         await hub.disconnect(ws, user["id"])
 
 

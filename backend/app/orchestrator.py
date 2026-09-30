@@ -79,6 +79,8 @@ from .logging_setup import log_event
 from .engine.recovery_engine import RecoveryEngine
 from .schemas import Direction, EngineState, Signal, SignalDecision, TradePlan, TradeRecord, TradeFeatureSnapshot, TradeStatus, now_ts
 from .services.candle_store import CandleStore
+from .services.chart_service import normalize_timeframe
+from .services.chart_stream import ChartStreamer
 from .services.market import MarketProvider, OrderNotSent, build_provider, TIMEFRAMES
 from .services.market_init import MarketInitManager, MARKET_INIT_SERVICE_NAME
 from .services.telegram_bot import TelegramService
@@ -300,6 +302,16 @@ class Orchestrator:
         self.regime_tracker = RegimePerformanceTracker()
         self.health_manager = HealthScoreManager(user_id)
         self.candle_store = CandleStore(user_id)
+        # Live candles for the market chart. One loop per (asset, timeframe),
+        # shared by every tab watching that pair, and driven by the provider's
+        # own new_data_event -- so the chart needs neither its own connection
+        # nor a polling timer.
+        self.chart_streamer = ChartStreamer(
+            user_id,
+            self._chart_fetch_candles,
+            self._chart_broadcast,
+            self.provider.new_data_event,
+        )
         self.decision_store = DecisionStore(str(user_data_dir(user_id) / "decisions"))
         self.rejected_outcome_store = RejectedOutcomeStore(str(user_data_dir(user_id) / "rejected_outcomes.json"))
         self.drift_detector = DriftDetector(
@@ -1552,9 +1564,52 @@ class Orchestrator:
             })
         await self.broadcast_state()
 
+    # ── chart streaming adapters ───────────────────────────────────────────
+    # Thin only: the streamer owns the loop, the rate limit and the dedupe.
+    # These just reach the existing provider and the existing websocket hub,
+    # so the chart has no market connection of its own.
+
+    async def _chart_fetch_candles(self, asset: str, timeframe: str, count: int):
+        """Read candles through the same provider the trading engine uses."""
+        return await self.provider.get_candles(asset, timeframe, count)
+
+    async def _chart_broadcast(self, event: str, data: Dict[str, Any]) -> None:
+        """Push a chart frame to this user's existing websocket connections."""
+        try:
+            await hub.broadcast(self.user_id, event, data)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("chart: broadcast failed for user=%s: %s",
+                         self.user_id, type(exc).__name__)
+
+    async def subscribe_chart(self, asset: str, timeframe: str) -> bool:
+        """Start (or attach to) live candles for one asset/timeframe pair.
+
+        Returns False for a timeframe this system does not know, so the client
+        gets a clear answer instead of a stream that never produces anything.
+        """
+        tf = normalize_timeframe(timeframe)
+        if tf is None:
+            return False
+        return await self.chart_streamer.subscribe(asset, tf)
+
+    async def unsubscribe_chart(self, asset: str, timeframe: str) -> None:
+        tf = normalize_timeframe(timeframe) or timeframe
+        await self.chart_streamer.unsubscribe(asset, tf)
+
     async def stop(self) -> None:
         self._running = False
         self._supervisor.stop()
+        # Chart streams first: they are pure consumers, so cancelling them
+        # early stops any further candle fetches while the provider is still
+        # healthy enough to answer them.
+        try:
+            await asyncio.wait_for(self.chart_streamer.stop(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning("[shutdown] user=%s chart streamer did not stop in time",
+                           self.user_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[shutdown] chart streamer stop raised %s",
+                         type(exc).__name__)
         # Stop the Market Initialization Manager first so it stops feeding
         # new history work in while the core loops are being torn down.
         # Bounded, like everything else in this teardown: its own stop()

@@ -533,3 +533,130 @@ def test_observation_never_raises_on_a_broken_provider():
 
     sm = _observe(_Boom())          # must not raise
     assert sm.trading_allowed is False
+
+
+# ── an inconclusive auth attempt is not an auth failure ─────────────────────
+#
+# `create_fresh_session()` can fail because the broker never answered (socket
+# down, probe timed out) rather than because it rejected the credentials. Both
+# used to consume the same 3-attempt budget, so three network blips would reach
+# AUTH_EXHAUSTED and pause trading on a perfectly healthy session.
+
+def _machine():
+    from app.engine.session_recovery import RecoveryPolicy
+    return SessionRecoveryStateMachine(policy=RecoveryPolicy())
+
+
+def _reject(sm):
+    sm.handle(SessionEvent.AUTH_REJECTED, "broker rejected the session")
+
+
+def test_network_blips_do_not_exhaust_the_auth_budget():
+    sm = _machine()
+    _reject(sm)
+
+    for _ in range(3):
+        assert sm.begin_auth_attempt()
+        sm.handle(SessionEvent.FRESH_SESSION_FAILED, "broker gave no verdict")
+        sm.note_inconclusive_attempt("broker did not confirm (unknown)")
+
+    assert sm.auth_attempts == 0, "blips must be refunded"
+    assert sm.inconclusive_attempts() == 3
+    assert sm.state is not SessionState.AUTH_EXHAUSTED
+    assert sm.begin_auth_attempt() is True, "a healthy session must stay reachable"
+
+
+def test_real_auth_failures_still_exhaust_at_three():
+    """The safety control must survive the refund."""
+    sm = _machine()
+    _reject(sm)
+
+    for _ in range(3):
+        assert sm.begin_auth_attempt()
+        sm.handle(SessionEvent.FRESH_SESSION_FAILED, "fresh authentication failed")
+        # no refund: a real rejection consumes the budget
+
+    assert sm.auth_attempts == 3
+    assert sm.begin_auth_attempt() is False
+    assert sm.state is SessionState.AUTH_EXHAUSTED
+
+
+def test_inconclusive_attempts_are_bounded_not_infinite():
+    """A persistent outage must terminate instead of hammering sign-in."""
+    sm = _machine()
+    _reject(sm)
+
+    attempts = 0
+    for _ in range(20):
+        if not sm.begin_auth_attempt():
+            break
+        attempts += 1
+        sm.handle(SessionEvent.FRESH_SESSION_FAILED, "broker gave no verdict")
+        sm.note_inconclusive_attempt("broker did not confirm (unknown)")
+
+    assert sm.state is SessionState.AUTH_EXHAUSTED
+    # 8 allowed, then the 9th is refused. The refund keeps _auth_attempts at
+    # zero, so only the terminal-state check can stop this loop -- asserting
+    # the count is what proves the cap is real rather than cosmetic.
+    assert attempts == 8, f"expected 8 attempts, got {attempts}"
+    assert sm.begin_auth_attempt() is False
+
+
+def test_exhausted_state_refuses_further_attempts():
+    """Regression: the cap used to set AUTH_EXHAUSTED without stopping
+    anything, because nothing checked the state."""
+    sm = _machine()
+    _reject(sm)
+    for _ in range(3):
+        assert sm.begin_auth_attempt()
+        sm.handle(SessionEvent.FRESH_SESSION_FAILED, "auth failed")
+
+    assert sm.state is SessionState.AUTH_EXHAUSTED
+    assert sm.begin_auth_attempt() is False
+    assert sm.auth_in_flight is False
+
+
+def test_recovery_still_possible_after_blips():
+    """Blips must not lock out a session that later authenticates."""
+    sm = _machine()
+    _reject(sm)
+
+    for _ in range(3):
+        assert sm.begin_auth_attempt()
+        sm.handle(SessionEvent.FRESH_SESSION_FAILED, "broker gave no verdict")
+        sm.note_inconclusive_attempt("broker did not confirm (unknown)")
+
+    assert sm.begin_auth_attempt()
+    sm.handle(SessionEvent.FRESH_SESSION_SUCCEEDED, "new session obtained")
+    assert sm.trading_allowed is False, "not yet: the socket must confirm"
+    sm.handle(SessionEvent.AUTH_CONFIRMED, "broker confirmed")
+
+    assert sm.trading_allowed is True
+    assert sm.state is SessionState.CONNECTED
+
+
+def test_reset_clears_the_inconclusive_counter_too():
+    sm = _machine()
+    _reject(sm)
+    assert sm.begin_auth_attempt()
+    sm.handle(SessionEvent.FRESH_SESSION_FAILED, "no verdict")
+    sm.note_inconclusive_attempt("no verdict")
+    assert sm.inconclusive_attempts() == 1
+
+    sm.reset_auth_budget("human completed OTP")
+
+    assert sm.inconclusive_attempts() == 0
+    assert sm.auth_in_flight is False
+
+
+def test_no_deadlock_after_an_inconclusive_failure():
+    """The in-flight flag must be released, or every later attempt is refused."""
+    sm = _machine()
+    _reject(sm)
+    assert sm.begin_auth_attempt()
+    assert sm.auth_in_flight is True
+
+    sm.handle(SessionEvent.FRESH_SESSION_FAILED, "broker gave no verdict")
+    sm.note_inconclusive_attempt("broker did not confirm (unknown)")
+
+    assert sm.auth_in_flight is False

@@ -1489,15 +1489,28 @@ class Orchestrator:
             ok = False
 
         if not ok:
-            # refresh_session returns False both for a failed login and for
-            # "OTP was requested but no callback resolved it". Either way the
-            # broker has not given us a session.
+            # FRESH_SESSION_FAILED is emitted first in every branch: it is what
+            # clears the in-flight flag. WS_DISCONNECTED must not be used here
+            # instead -- while the auth path owns the lifecycle it returns
+            # early and leaves the flag set, deadlocking every later attempt.
+            validation = getattr(self.auth_manager.state, "last_validation", None)
+            inconclusive = bool(getattr(validation, "unknown", False))
+
             if self.state.otp_required:
                 self.session_recovery.handle(SessionEvent.OTP_REQUIRED,
                                              "broker requires a PIN")
             else:
-                self.session_recovery.handle(SessionEvent.FRESH_SESSION_FAILED,
-                                             "fresh authentication failed")
+                self.session_recovery.handle(
+                    SessionEvent.FRESH_SESSION_FAILED,
+                    "broker gave no verdict" if inconclusive
+                    else "fresh authentication failed")
+                if inconclusive:
+                    # The broker never answered, so this was not an auth
+                    # failure. Refund the attempt -- bounded, so a persistent
+                    # outage still terminates -- otherwise three network blips
+                    # would pause trading on a perfectly healthy session.
+                    self.session_recovery.note_inconclusive_attempt(
+                        getattr(validation, "reason", "no verdict"))
             await self.broadcast_state()
             return
 

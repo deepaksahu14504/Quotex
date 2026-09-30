@@ -100,6 +100,11 @@ class RecoveryPolicy:
     """
 
     max_auth_attempts: int = 3
+    #: Attempts where the broker never gave a verdict at all (socket down,
+    #: probe timed out). These are NOT auth failures, so they must not consume
+    #: `max_auth_attempts` -- but they are still capped, because a persistent
+    #: outage would otherwise loop on the sign-in endpoint forever.
+    max_inconclusive_attempts: int = 8
     auth_backoff_base_seconds: float = 5.0
     auth_backoff_max_seconds: float = 300.0
     #: How long a positive auth confirmation stays trustworthy before we want
@@ -161,6 +166,7 @@ class SessionRecoveryStateMachine:
         self._auth_confirmed_at: Optional[float] = None
         self._auth_attempts: int = 0
         self._auth_attempt_in_flight: bool = False
+        self._inconclusive_attempts: int = 0
         self._reconnect_in_flight: bool = False
         self._otp_required: bool = False
         self._last_reason: str = ""
@@ -390,6 +396,13 @@ class SessionRecoveryStateMachine:
         if self._auth_attempt_in_flight:
             logger.warning("session_state: auth attempt already in flight; refusing concurrent login")
             return False
+        # Terminal state wins over the counters. Without this the inconclusive
+        # refund can keep `_auth_attempts` at zero forever, so reaching
+        # max_inconclusive_attempts would set AUTH_EXHAUSTED without actually
+        # stopping anything -- the cap would be cosmetic.
+        if self.state is SessionState.AUTH_EXHAUSTED:
+            logger.warning("session_state: auth is exhausted; refusing a further attempt")
+            return False
         if self._auth_attempts >= self.policy.max_auth_attempts:
             logger.warning("session_state: auth budget exhausted (%d/%d)",
                            self._auth_attempts, self.policy.max_auth_attempts)
@@ -405,9 +418,40 @@ class SessionRecoveryStateMachine:
         delay = self.policy.auth_backoff_base_seconds * (2 ** attempt)
         return min(delay, self.policy.auth_backoff_max_seconds)
 
+    def note_inconclusive_attempt(self, reason: str = "broker gave no verdict") -> None:
+        """Refund one auth attempt because the broker never answered.
+
+        `unknown` is not an auth failure: the socket may have been down, or the
+        probe may have timed out. Counting it against `max_auth_attempts` would
+        let three network blips pause trading on a perfectly healthy session.
+
+        The refund is bounded by `max_inconclusive_attempts`, so a persistent
+        outage still terminates instead of hammering the sign-in endpoint.
+
+        Must be called AFTER FRESH_SESSION_FAILED, which is what clears the
+        in-flight flag; this method deliberately does not touch that flag.
+        """
+        self._auth_attempts = max(0, self._auth_attempts - 1)
+        self._inconclusive_attempts += 1
+        if self._inconclusive_attempts >= self.policy.max_inconclusive_attempts:
+            logger.warning(
+                "session_state: %d inconclusive auth attempts with no broker "
+                "verdict (%s); treating as exhausted rather than retrying "
+                "forever", self._inconclusive_attempts, reason,
+            )
+            self._go(SessionState.AUTH_EXHAUSTED, reason)
+            return
+        logger.info("session_state: inconclusive auth attempt refunded (%d/%d); %s",
+                    self._inconclusive_attempts,
+                    self.policy.max_inconclusive_attempts, reason)
+
+    def inconclusive_attempts(self) -> int:
+        return self._inconclusive_attempts
+
     def reset_auth_budget(self, reason: str = "manual reset") -> None:
         """Clear the attempt counter (e.g. after a human completes OTP)."""
         self._auth_attempts = 0
+        self._inconclusive_attempts = 0
         self._auth_attempt_in_flight = False
         self._otp_required = False
         if self.state in (SessionState.AUTH_EXHAUSTED, SessionState.REAUTH_REQUIRED):

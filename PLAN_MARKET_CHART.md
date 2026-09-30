@@ -237,3 +237,50 @@ no fabricated candle.
    wire value `"1day"`, so no existing timeframe handling changes.
 4. **Throttle interval for `candle_update`** — I propose ~1s per watched
    asset/timeframe. Fast enough to feel live, cheap enough not to spam.
+
+---
+
+## 7. Outcome — what was built, and what could not be verified here
+
+Built in five commits (`80161d4` → `c4055d3`), backend then frontend.
+
+**Backend.** `candle_aggregate.py` (bucketing, validation, aggregation),
+`chart_service.py` (timeframe labels, clamping, the response envelope),
+`chart_stream.py` (one shared loop per asset/timeframe, driven by the
+provider's own `new_data_event`), two read-only endpoints
+(`/api/chart/candles`, `/api/chart/meta`), a `candle_update` websocket event
+on the connection that already existed, and `chart_subscribe` /
+`chart_unsubscribe` control messages. `/api/candles` is unchanged for its
+existing callers.
+
+**Frontend.** `components/chart/` — `MarketChart`, `ChartToolbar`,
+`ChartStatus`, plus `useChartCandles`, `candleBus`, `indicators`,
+`candleMath`, `chartTheme`, `chartFormat`, `timeFormat`. `Chart.tsx` keeps its
+named export and prop, so `App.tsx:159` is untouched. The 2.5-second polling
+interval is gone.
+
+**Checks run.** Backend 704 passed / 1 skipped (from 620/1 at the start of this
+task). Frontend 35 passed / 0 failed. `tsc -b && vite build` clean. oxlint over
+`src` reports the same 3 warnings and 1 error as the pre-task baseline at
+`4253d79`, confirmed by linting that commit in a separate worktree — no new
+findings.
+
+**What could not be verified here, and why.** This sandbox has no outbound
+network: `curl https://api.binance.com/...` and even `https://example.com`
+both return status 000. `PublicDataProvider.connect()` therefore returns
+False and every `get_candles()` call returns an empty list. So:
+
+* `/api/chart/candles` returns `{"candles": [], "rejected": 0}` with a 200.
+  That is the provider genuinely having no data, not an error being swallowed
+  — the endpoint was exercised directly against the provider to confirm it.
+* The chart consequently renders its error state ("Chart unavailable"), which
+  is the intended behaviour and is the reason the brief's "never render fake
+  data" rule was implemented as an explicit state rather than a blank canvas.
+* **No candle has been observed arriving from a live broker, and no
+  `candle_update` frame has been observed crossing a real websocket.** Both
+  paths are covered by tests against injected providers and callables, but
+  the end-to-end path with a live Quotex or Binance connection is unverified.
+  Anyone running this against real credentials should confirm that first.
+
+The chart cannot be exercised in a browser here either; it was type-checked,
+built and linted, and its pure logic tested, but it has not been looked at.

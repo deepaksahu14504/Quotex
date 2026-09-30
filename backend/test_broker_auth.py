@@ -12,12 +12,15 @@ from __future__ import annotations
 import asyncio
 import json
 import stat
+from types import SimpleNamespace
 
 import pytest
 
 from app.broker_auth import (
     AUTH_BROWSER_REQUIRED,
     AUTH_FRESH_SESSION_REQUIRED,
+    AUTH_FRESH_SESSION_STARTED,
+    AUTH_OTP_REQUIRED,
     AUTH_RECONNECT_FAILED,
     AUTH_RECONNECT_SUCCESS,
     AUTH_SESSION_EXPIRED,
@@ -613,3 +616,72 @@ def test_bundle_usability_requires_ssid_and_cookies():
     assert SessionBundle(ssid="a", cookies=None).is_usable() is False
     assert SessionBundle(ssid=None, cookies="b").is_usable() is False
     assert SessionBundle(ssid="a", cookies="b", expired=True).is_usable() is False
+
+
+# ── OTP / emailed PIN is observable (item 6/11) ───────────────────────────
+#
+# The broker's own `get_auth_status()` returns only
+# authenticated | authenticating | not_authenticated | failed | unknown. It can
+# never say "a PIN is pending", because OTP is a blocking interaction inside the
+# login call, not a websocket state. So the orchestrator's probe reports OTP
+# from `state.otp_required`. Without that, a login parked on a PIN would look
+# like an ordinary auth failure and invite another login on top of one already
+# waiting for the user.
+
+@pytest.mark.asyncio
+async def test_pending_pin_is_reported_and_blocks_further_logins(tmp_path):
+    events = []
+    manager, store, calls = make_manager(
+        tmp_path, "u1", status="otp_required",
+        on_event=lambda e, **kw: events.append(e),
+    )
+    await manager.save_session("pending-ssid", "cookie=1", "UA/1.0")
+
+    result = await manager.validate_session()
+
+    assert result.otp_required is True
+    assert result.valid is False
+    assert result.expired is False, "a pending PIN is NOT session expiry"
+    assert AUTH_OTP_REQUIRED in events
+
+    # reconnect must stop, not start a second login over the pending one
+    assert await manager.reconnect_session() is False
+    assert calls["login"] == 0, "must not log in over a pending PIN"
+    assert AUTH_FRESH_SESSION_STARTED not in events
+    assert manager.can_trade is False
+
+
+@pytest.mark.asyncio
+async def test_pending_pin_does_not_discard_the_session(tmp_path):
+    manager, store, calls = make_manager(tmp_path, "u1", status="otp_required")
+    await manager.save_session("pending-ssid", "cookie=1", "UA/1.0")
+
+    assert await manager.reconnect_session() is False
+    assert store.rows["u1"]["ssid"] == "pending-ssid", "session must survive"
+    assert manager.session_path.exists()
+
+
+def test_orchestrator_probe_reports_otp_from_state_not_the_broker():
+    """The REAL orchestrator probe, with a negative control.
+
+    `get_auth_status()` cannot express OTP, so the probe must read the flag.
+    Stubbing only the inputs the method touches -- the branch under test is the
+    real one.
+    """
+    import app.orchestrator as orch
+
+    def probe(otp_required, auth_status):
+        stub = SimpleNamespace(
+            state=SimpleNamespace(otp_required=otp_required),
+            provider=SimpleNamespace(get_auth_status=lambda: auth_status),
+        )
+        return orch.Orchestrator._probe_auth_status(stub)
+
+    assert probe(True, "authenticating") == "otp_required"
+    assert probe(False, "failed") == "failed"
+    assert probe(False, "authenticated") == "authenticated"
+
+    # a provider with no auth introspection at all must not look healthy
+    bare = SimpleNamespace(state=SimpleNamespace(otp_required=False),
+                           provider=SimpleNamespace())
+    assert orch.Orchestrator._probe_auth_status(bare) == "unknown"

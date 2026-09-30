@@ -662,7 +662,24 @@ class Orchestrator:
         return bool(await refresh())
 
     def _probe_auth_status(self) -> str:
-        """The broker's own verdict on the current session."""
+        """The verdict the auth manager should act on.
+
+        Two sources, because the broker and the login flow report differently:
+
+        * `provider.get_auth_status()` returns only
+          authenticated | authenticating | not_authenticated | failed | unknown.
+          It can never say "a PIN is pending" -- OTP is not a websocket state.
+        * The emailed PIN is a blocking interaction *inside* the login call:
+          `_otp_callback` raises `state.otp_required` while it waits for the
+          human. That flag is the only place OTP is observable from outside.
+
+        So OTP is reported from the flag. Without this, the manager's
+        AUTH_OTP_REQUIRED path could never fire, and a login parked on a PIN
+        would look like a plain authentication failure -- inviting a fresh
+        login attempt on top of one already waiting for the user.
+        """
+        if self.state.otp_required:
+            return "otp_required"
         probe = getattr(self.provider, "get_auth_status", None)
         if probe is None:
             return "unknown"

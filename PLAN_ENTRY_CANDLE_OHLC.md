@@ -71,3 +71,64 @@ It does not recompute a result the broker already reported. It does not
 reconstruct an entry candle from approximate data when the real one is
 available, and it does not invent one when it is not. It does not add a candle
 source, a trade model, or an endpoint.
+
+---
+
+## Outcome
+
+Four commits: `cffc7a5` (lookup), `c90cc9a` (capture), `0dc0db6` (chart),
+`411e154` (history).
+
+### Checks run
+
+| Check | Result |
+| --- | --- |
+| Backend suite | 739 passed, 1 skipped (was 704/1) |
+| `test_entry_candle.py` | 29 passed |
+| `test_trade_entry_ohlc_api.py` | 6 passed |
+| Frontend `npm run test:chart` | 35 passed, 0 failed |
+| `tsc -b && vite build` | clean, 332 modules |
+| oxlint over `src` | 3 warnings, 1 error — identical to the pre-task baseline |
+
+The one lint error is the pre-existing conditional `useState` at
+`Settings.tsx:165`; nothing in this task touches that file.
+
+### Verified live, over real HTTP
+
+A trade was written into a real user's store and read back through
+`GET /api/trades`:
+
+```
+created_at (execution)   = 1759246338   15:32:18
+entry_candle_timestamp   = 1759246200   15:30:00
+chart bucket             = 1759246200   MATCH
+entry_candle_open/high/low/close = 1.1441 / 1.14435 / 1.144 / 1.14422
+status = win   profit = 425.0   closed_at = 1759247100
+```
+
+This is requirement 10 checked end to end: the execution at 15:32:18 resolved
+to the 15:30 candle, not to 15:15 (1759245300) and not to 15:45 (1759247100),
+and the bucket the chart computes for the same instant is the same number.
+
+### What could not be verified here
+
+Two gaps, both environmental:
+
+1. **No trade has been executed against a live broker in this session.** The
+   sandbox has no outbound network, so `_attach_entry_candle` has not run
+   against real provider candles on the real execution path. Its body is
+   exercised by tests calling it unbound, with a stubbed candle fetch — the
+   method is real, the broker is not.
+2. **The UI has not been looked at.** There is no browser here. The chart and
+   History were type-checked, built and linted, and the pure logic tested, but
+   the rendered result is unconfirmed.
+
+### One deliberate difference from the request
+
+The mock shows a four-line label stacked on the chart
+(`CALL` / `Entry 1.14422` / `IN THE MONEY` / `+$500`). `SeriesMarker.text` is a
+plain string and lightweight-charts draws it as one line, so the on-chart label
+is compact (`CALL`, or `CALL +$500.00` once settled) and the full stacked detail
+— direction, entry price, entry candle OHLC, result, P/L — appears as a block
+when the crosshair is on that bar, and in full in Trade History. No information
+was dropped to fit the library; only its placement moved.

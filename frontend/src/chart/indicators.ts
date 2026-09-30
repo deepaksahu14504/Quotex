@@ -10,7 +10,7 @@
  * draws lines.
  */
 
-import type { ChartCandle } from "./candleMath";
+import type { ChartCandle } from "./candleMath.ts";
 
 /** A point on an indicator line, aligned to a candle timestamp. */
 export interface IndicatorPoint {

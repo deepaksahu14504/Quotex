@@ -14,7 +14,7 @@
  * touch the store, so a tick costs one function call and no render.
  */
 
-import { mergeCandle, type ChartCandle, type RawCandle, validateCandle } from "./candleMath";
+import { mergeCandle, type ChartCandle, type RawCandle, validateCandle } from "./candleMath.ts";
 
 export interface CandleFrame {
   asset: string;

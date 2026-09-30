@@ -8,10 +8,10 @@
  */
 
 import { memo } from "react";
-import type { HoverInfo } from "./MarketChart";
-import { fmtPrice, precisionFor } from "./chartFormat";
-import { timeLabel } from "./timeFormat";
-import type { ChartPhase } from "./useChartCandles";
+import type { HoverInfo } from "./MarketChart.ts";
+import { fmtPrice, precisionFor } from "./chartFormat.ts";
+import { timeLabel } from "./timeFormat.ts";
+import type { ChartPhase } from "./useChartCandles.ts";
 
 interface Props {
   phase: ChartPhase;

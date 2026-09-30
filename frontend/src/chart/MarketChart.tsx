@@ -35,7 +35,7 @@ import {
   type UTCTimestamp,
 } from "lightweight-charts";
 import type { Signal } from "../types";
-import { indicatorColor, getChartTheme } from "./chartTheme";
+import { indicatorColor, getChartTheme } from "./chartTheme.ts";
 import {
   bollinger,
   emaSeries,
@@ -43,10 +43,10 @@ import {
   BOLLINGER_PERIOD,
   BOLLINGER_MULT,
   type IndicatorToggles,
-} from "./indicators";
-import type { ChartCandle } from "./candleMath";
-import { precisionFor, timeframeSeconds } from "./chartFormat";
-import { chartTickFormatter } from "./timeFormat";
+} from "./indicators.ts";
+import type { ChartCandle } from "./candleMath.ts";
+import { precisionFor, timeframeSeconds } from "./chartFormat.ts";
+import { chartTickFormatter } from "./timeFormat.ts";
 
 interface Props {
   asset: string;

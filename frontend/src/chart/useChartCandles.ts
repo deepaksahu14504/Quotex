@@ -19,8 +19,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import { unwatchChart, watchChart } from "../store";
-import { applyFrame, onCandleUpdate } from "./candleBus";
-import { mergeCandle, normalizeCandles, type ChartCandle } from "./candleMath";
+import { applyFrame, onCandleUpdate } from "./candleBus.ts";
+import { mergeCandle, normalizeCandles, type ChartCandle } from "./candleMath.ts";
 
 export type ChartPhase = "idle" | "loading" | "live" | "error";
 

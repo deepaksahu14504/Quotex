@@ -8,8 +8,8 @@
 
 import { memo, useState } from "react";
 import type { AssetInfo } from "../types";
-import type { IndicatorToggles } from "./indicators";
-import { timeframeLabel } from "./timeFormat";
+import type { IndicatorToggles } from "./indicators.ts";
+import { timeframeLabel } from "./timeFormat.ts";
 
 interface Props {
   assets: AssetInfo[];

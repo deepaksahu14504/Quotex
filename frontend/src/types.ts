@@ -67,6 +67,25 @@ export interface Trade {
   timeframe?: string;
   closed_at?: number;
   note?: string;
+  /**
+   * OHLC of the candle this trade actually entered on, captured at execution
+   * time from the same source the chart reads -- so the chart marker, its
+   * tooltip and Trade History all quote one bar.
+   *
+   * Optional: absent on trades recorded before these existed, and null when the
+   * entry bar could not be resolved. Never reconstructed from a neighbouring
+   * candle, so a missing value means "unknown", not "roughly this".
+   *
+   * The rest of the entry/result data already lives above under the project's
+   * own names: `open_price` is the executed entry price, `created_at` is the
+   * execution timestamp, `status` is the broker's own result and `profit` its
+   * P/L. Nothing here duplicates them.
+   */
+  entry_candle_timestamp?: number | null;
+  entry_candle_open?: number | null;
+  entry_candle_high?: number | null;
+  entry_candle_low?: number | null;
+  entry_candle_close?: number | null;
 }
 
 export interface AssetInfo {

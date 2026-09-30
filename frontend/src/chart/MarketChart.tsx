@@ -34,7 +34,7 @@ import {
   type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
-import type { Signal } from "../types";
+import type { Trade } from "../types";
 import { indicatorColor, getChartTheme } from "./chartTheme.ts";
 import {
   bollinger,
@@ -46,7 +46,7 @@ import {
 } from "./indicators.ts";
 import type { ChartCandle } from "./candleMath.ts";
 import { precisionFor, timeframeSeconds } from "./chartFormat.ts";
-import { chartTickFormatter } from "./timeFormat.ts";
+import { bucketStart, chartTickFormatter } from "./timeFormat.ts";
 
 interface Props {
   asset: string;
@@ -55,7 +55,10 @@ interface Props {
   /** Bumped by the data hook whenever a fresh history load completes. */
   loadToken: number;
   toggles: IndicatorToggles;
-  signals: Signal[];
+  /** Executed trades. Markers come from these, not from signals -- a marker
+   *  belongs on the bar the order actually filled on, at the price it actually
+   *  filled at, which a signal's own timestamp and price are not. */
+  trades: Trade[];
   /** Subscribe to live frames arriving over the websocket. */
   subscribeLive: (handler: (candle: ChartCandle) => void) => () => void;
   onHover: (info: HoverInfo | null) => void;
@@ -72,6 +75,8 @@ export interface HoverInfo {
   ema21?: number;
   ema50?: number;
   boll?: { upper: number; middle: number; lower: number };
+  /** The trade that entered on this bar, when there is one. */
+  trade?: Trade;
 }
 
 /** How much chart history to keep visible on first paint, in bars. */
@@ -83,7 +88,7 @@ export default function MarketChart({
   candles,
   loadToken,
   toggles,
-  signals,
+  trades,
   subscribeLive,
   onHover,
 }: Props) {
@@ -103,6 +108,9 @@ export default function MarketChart({
 
   // Latest values for the crosshair readout, keyed by timestamp.
   const indicatorIndex = useRef(new Map<number, HoverInfo>());
+  /** Trades by the bucket they entered on, so the crosshair can show the full
+   *  entry/result detail for the bar under it. */
+  const tradeIndex = useRef(new Map<number, Trade>());
   const candlesRef = useRef<ChartCandle[]>(candles);
   candlesRef.current = candles;
 
@@ -212,6 +220,7 @@ export default function MarketChart({
         ema21: ind?.ema21,
         ema50: ind?.ema50,
         boll: ind?.boll,
+        trade: tradeIndex.current.get(ts),
       });
     });
 
@@ -225,6 +234,8 @@ export default function MarketChart({
       }
       chartRef.current = null;
       priceRef.current = null;
+      indicatorIndex.current = new Map();
+      tradeIndex.current = new Map();
       emaRefs.current = { ema9: null, ema21: null, ema50: null };
       bollRefs.current = { upper: null, middle: null, lower: null };
       priceLineRef.current = null;
@@ -320,41 +331,82 @@ export default function MarketChart({
   );
 
   /**
-   * Place CALL markers below the bar and PUT markers above it, using only the
-   * signals the engine already emitted. The chart adds nothing of its own.
+   * Mark the bars where trades actually executed.
+   *
+   * Sourced from trades, not signals. A signal's timestamp is when it was
+   * generated and its price is the price at generation; an order can fill
+   * seconds later at a different price, and the requirement is explicit that
+   * the marker belongs on the execution. So this reads the trade record.
+   *
+   * The bar comes from `entry_candle_timestamp`, resolved on the server by the
+   * same bucket function the chart uses. Only when that is absent -- a trade
+   * recorded before the field existed, or one whose bar could not be resolved
+   * -- does this fall back to bucketing `created_at`, which is still the
+   * execution timestamp, just aligned locally.
    */
-  const drawSignalMarkers = useCallback(
-    (rows: Signal[], tf: string, barSec: number) => {
+  const drawTradeMarkers = useCallback(
+    (rows: Trade[], tf: string, barSec: number) => {
       const api = markersRef.current;
       if (!api) return;
 
       const windowStart = candlesRef.current[0]?.timestamp ?? 0;
       const windowEnd = candlesRef.current[candlesRef.current.length - 1]?.timestamp ?? 0;
       if (windowStart === 0) {
+        tradeIndex.current = new Map();
         api.setMarkers([]);
         return;
       }
 
+      const index = new Map<number, Trade>();
       const markers: SeriesMarker<Time>[] = [];
-      for (const sig of rows) {
-        if (sig.asset !== asset || sig.timeframe !== tf) continue;
-        // Snap to the bar the signal belongs to. A signal's timestamp is when
-        // it was created, which is usually mid-bar; a marker at an exact
-        // mid-bar second would not line up with any candle.
-        const bucket = Math.floor(sig.created_at / barSec) * barSec;
+
+      for (const trade of rows) {
+        if (trade.asset !== asset) continue;
+        // A trade with no timeframe recorded is not filtered out: the asset
+        // match is enough, and dropping it would silently hide a real trade.
+        if (trade.timeframe && trade.timeframe !== tf) continue;
+
+        const raw =
+          typeof trade.entry_candle_timestamp === "number" &&
+          Number.isFinite(trade.entry_candle_timestamp)
+            ? trade.entry_candle_timestamp
+            : Number.isFinite(trade.created_at)
+              ? bucketStart(trade.created_at, barSec)
+              : null;
+        if (raw === null) continue;
+
+        const bucket = Number(raw);
         if (bucket < windowStart || bucket > windowEnd) continue;
 
-        // Signal.direction is lowercase "call" | "put" (types.ts:1), the same
-        // casing the rest of the UI compares against.
-        const isCall = sig.direction === "call";
+        // Direction is lowercase "call" | "put" (types.ts:1).
+        const isCall = trade.direction === "call";
+        // The broker's own result. "win" is IN THE MONEY and "loss" is OUT OF
+        // IT; nothing here recomputes an outcome the broker already reported.
+        const settled = trade.status === "win" || trade.status === "loss";
+        const color =
+          trade.status === "win" ? theme.up
+          : trade.status === "loss" ? theme.down
+          : trade.status === "draw" ? theme.gold
+          : theme.accent;
+
+        const label = trade.direction.toUpperCase();
+        const pnl =
+          settled && Number.isFinite(trade.profit)
+            ? ` ${trade.profit >= 0 ? "+" : "\u2212"}$${Math.abs(trade.profit).toFixed(2)}`
+            : trade.status === "draw" ? " DRAW"
+            : "";
+
+        index.set(bucket, trade);
         markers.push({
           time: bucket as UTCTimestamp,
           position: isCall ? "belowBar" : "aboveBar",
-          color: isCall ? theme.up : theme.down,
+          color,
           shape: isCall ? "arrowUp" : "arrowDown",
-          text: isCall ? "CALL" : "PUT",
+          text: `${label}${pnl}`,
         });
       }
+
+      tradeIndex.current = index;
 
       // Newest last: lightweight-charts requires ordered markers and silently
       // drops the rest if they are not.
@@ -432,7 +484,7 @@ export default function MarketChart({
       // 300 candles is a few thousand operations, but doing it for four
       // hidden lines on every tick is waste for nothing.
       drawIndicators(candlesRef.current);
-      drawSignalMarkers(signals, timeframe, barSeconds);
+      drawTradeMarkers(trades, timeframe, barSeconds);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subscribeLive]);
@@ -449,10 +501,10 @@ export default function MarketChart({
     drawIndicators(candles);
   }, [toggles, candles, drawIndicators]);
 
-  // ── signal markers, from the signals the engine already produced ─────────
+  // ── trade markers, from the trades the engine actually executed ─────────
   useEffect(() => {
-    drawSignalMarkers(signals, timeframe, barSeconds);
-  }, [signals, timeframe, candles, barSeconds, drawSignalMarkers]);
+    drawTradeMarkers(trades, timeframe, barSeconds);
+  }, [trades, timeframe, candles, barSeconds, drawTradeMarkers]);
 
   // ── helpers ──────────────────────────────────────────────────────────────
 

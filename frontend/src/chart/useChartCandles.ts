@@ -35,6 +35,13 @@ export interface ChartDataState {
   /** Monotonic counter; changes when a fresh history load completes. */
   loadToken: number;
   lastUpdateAt: number | null;
+  /**
+   * The newest candle, so the header can show the current bar's OHLC without a
+   * crosshair. Kept in state rather than read from the ref on demand because it
+   * has to re-render the header as the bar forms -- the canvas is untouched
+   * either way, since the chart lives in a ref.
+   */
+  latest: ChartCandle | null;
 }
 
 const HISTORY_LIMIT = 300;
@@ -60,6 +67,7 @@ export function useChartCandles(
     connected,
     loadToken: 0,
     lastUpdateAt: null,
+    latest: null,
   });
 
   const candlesRef = useRef<ChartCandle[]>([]);
@@ -127,6 +135,7 @@ export function useChartCandles(
           rejected: rejected + (res.rejected ?? 0),
           loadToken: s.loadToken + 1,
           lastUpdateAt: candles.length ? candles[candles.length - 1].timestamp : null,
+          latest: candles.length ? candles[candles.length - 1] : null,
         }));
       })
       .catch((err: unknown) => {
@@ -165,8 +174,11 @@ export function useChartCandles(
         }
       }
 
-      // Throttled: state drives only the small status readout, not the canvas.
-      setState((s) => ({ ...s, lastUpdateAt: candle.timestamp }));
+      // State drives only the small header readout, never the canvas. This
+      // already ran once per frame for lastUpdateAt, so carrying the candle
+      // along costs no extra render -- and it is what lets the header's OHLC
+      // track a forming bar in real time.
+      setState((s) => ({ ...s, lastUpdateAt: candle.timestamp, latest: candle }));
     });
 
     return () => {

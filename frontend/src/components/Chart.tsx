@@ -36,7 +36,9 @@ const FALLBACK_TIMEFRAMES = [
 
 export function Chart({ timeframe }: { timeframe: string }) {
   const wsConnected = useStore((s) => s.wsConnected);
-  const signals = useStore((s) => s.signals);
+  // Trades, not signals: a marker belongs on the bar the order actually
+  // filled on, at the price it actually filled at.
+  const trades = useStore((s) => s.trades);
   const settings = useStore((s) => s.settings);
 
   const [assets, setAssets] = useState<AssetInfo[]>([]);
@@ -113,6 +115,7 @@ export function Chart({ timeframe }: { timeframe: string }) {
           rejected={0}
           hover={null}
           lastUpdateAt={null}
+          latest={null}
         />
       </div>
     );
@@ -142,7 +145,7 @@ export function Chart({ timeframe }: { timeframe: string }) {
           candles={candles}
           loadToken={state.loadToken}
           toggles={toggles}
-          signals={signals}
+          trades={trades}
           subscribeLive={subscribeLive}
           onHover={setHover}
         />
@@ -155,6 +158,7 @@ export function Chart({ timeframe }: { timeframe: string }) {
             rejected={state.rejected}
             hover={hover}
             lastUpdateAt={state.lastUpdateAt}
+            latest={state.latest}
           />
         </div>
       </div>

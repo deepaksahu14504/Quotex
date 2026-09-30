@@ -230,3 +230,119 @@ def test_the_chart_bucket_and_the_entry_bucket_are_the_same_number():
 
     assert entry.bucket == chart_bucket == T1530
     assert entry.candle.timestamp == chart_bucket
+
+
+# ── the orchestrator hook, executed for real ───────────────────────────────
+# Orchestrator cannot be constructed without a database, so the method is
+# called unbound against a stand-in that supplies only what it reads. The
+# method body is the real one.
+
+from types import SimpleNamespace
+
+from app.orchestrator import Orchestrator
+from app.schemas import TradeRecord, TradeStatus, Direction
+
+
+def make_trade(created_at: float, timeframe: str = "15m") -> TradeRecord:
+    return TradeRecord(
+        asset="EURUSD_otc", direction=Direction.CALL, amount=10.0, duration=900,
+        is_demo=True, status=TradeStatus.OPEN, open_price=1.14422,
+        timeframe=timeframe, created_at=created_at,
+    )
+
+
+def make_self(refetch=None, refetch_raises=False):
+    calls = []
+
+    async def _revalidation_candles(asset, tf):
+        calls.append((asset, tf))
+        if refetch_raises:
+            raise RuntimeError("broker down")
+        return refetch if refetch is not None else []
+
+    return SimpleNamespace(_revalidation_candles=_revalidation_candles), calls
+
+
+@pytest.mark.asyncio
+async def test_the_hook_writes_the_entry_ohlc_onto_the_trade():
+    trade = make_trade(EXEC_MID)
+    stand_in, calls = make_self()
+
+    await Orchestrator._attach_entry_candle(stand_in, trade, window(T1530, T1545))
+
+    assert trade.entry_candle_timestamp == float(T1530)
+    assert trade.entry_candle_open == 1.14410
+    assert trade.entry_candle_high == 1.14435
+    assert trade.entry_candle_low == 1.14400
+    assert trade.entry_candle_close == 1.14422
+    assert calls == [], "the cached candles were enough; no refetch needed"
+
+
+@pytest.mark.asyncio
+async def test_the_hook_refetches_when_the_entry_bucket_is_missing():
+    """A bar boundary crossed between revalidation and execution."""
+    trade = make_trade(EXEC_MID)
+    stand_in, calls = make_self(refetch=window(T1530, T1545))
+
+    # Cached set has only the previous bar, so the 15:30 bucket is absent.
+    await Orchestrator._attach_entry_candle(stand_in, trade, window(T1515))
+
+    assert calls == [("EURUSD_otc", "15m")], "should have refetched exactly once"
+    assert trade.entry_candle_timestamp == float(T1530)
+
+
+@pytest.mark.asyncio
+async def test_a_refetch_failure_leaves_nones_and_does_not_raise():
+    """Metadata capture must never surface as a failed trade."""
+    trade = make_trade(EXEC_MID)
+    stand_in, _ = make_self(refetch_raises=True)
+
+    await Orchestrator._attach_entry_candle(stand_in, trade, window(T1515))
+
+    assert trade.entry_candle_timestamp is None
+    assert trade.entry_candle_open is None
+    assert trade.status == TradeStatus.OPEN, "trade state untouched"
+
+
+@pytest.mark.asyncio
+async def test_the_hook_uses_the_execution_timestamp_not_the_signal_time():
+    """created_at is the execution time. A signal generated in the previous
+    bar must not drag the entry candle back with it."""
+    trade = make_trade(EXEC_MID)
+    stand_in, _ = make_self()
+    trade.signal_id = "sig-from-15:15"
+
+    await Orchestrator._attach_entry_candle(stand_in, trade, window(T1515, T1530))
+
+    assert trade.entry_candle_timestamp == float(T1530)
+    assert trade.entry_candle_timestamp != float(T1515)
+
+
+@pytest.mark.asyncio
+async def test_the_entry_fields_reach_the_wire_payload():
+    """trade_opened broadcasts trade.model_dump(), so prove the fields are in
+    it -- that is what makes the chart marker work without a new endpoint."""
+    trade = make_trade(EXEC_MID)
+    stand_in, _ = make_self()
+
+    await Orchestrator._attach_entry_candle(stand_in, trade, window(T1530))
+    payload = trade.model_dump()
+
+    for key in ("entry_candle_timestamp", "entry_candle_open", "entry_candle_high",
+                "entry_candle_low", "entry_candle_close"):
+        assert key in payload, f"{key} missing from the broadcast payload"
+    assert payload["entry_candle_timestamp"] == float(T1530)
+
+
+@pytest.mark.asyncio
+async def test_an_old_trade_record_without_the_fields_still_loads():
+    """TradeStore is JSON loaded through model_validate, so a record written
+    before these fields existed must deserialize rather than error."""
+    legacy = {
+        "id": "abc123", "asset": "EURUSD_otc", "direction": "call", "amount": 10.0,
+        "duration": 900, "is_demo": True, "status": "win", "profit": 8.5,
+        "payout": 85.0, "created_at": float(T1530),
+    }
+    trade = TradeRecord.model_validate(legacy)
+    assert trade.entry_candle_timestamp is None
+    assert trade.entry_candle_close is None

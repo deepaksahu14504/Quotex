@@ -321,6 +321,26 @@ class TradeRecord(BaseModel):
                                             # produced this trade, if the decision engine was on
     note: Optional[str] = None
     features: Optional[TradeFeatureSnapshot] = None
+    # ── Entry candle ───────────────────────────────────────────────────────
+    # The bar the trade actually entered on, captured at execution time from
+    # the same candle source the chart reads, so the chart marker, the marker's
+    # tooltip and Trade History all quote one bar rather than three slightly
+    # different ones.
+    #
+    # Deliberately NOT duplicated from fields that already exist above:
+    # `open_price` is the executed entry price, `created_at` is the execution
+    # timestamp (it is defaulted after place_order returns, not at signal
+    # time), `status` is the broker's own result, `profit` is the broker's P/L
+    # and `closed_at` is the exit time. Only the OHLC was missing.
+    #
+    # All Optional: a trade persisted before these existed deserializes with
+    # None, and a lookup that could not find the bar writes explicit Nones
+    # rather than borrowing a neighbouring candle's prices.
+    entry_candle_timestamp: Optional[float] = None
+    entry_candle_open: Optional[float] = None
+    entry_candle_high: Optional[float] = None
+    entry_candle_low: Optional[float] = None
+    entry_candle_close: Optional[float] = None
 
 
 class EngineState(BaseModel):

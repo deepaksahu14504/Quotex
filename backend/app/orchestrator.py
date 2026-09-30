@@ -80,6 +80,7 @@ from .engine.recovery_engine import RecoveryEngine
 from .schemas import Direction, EngineState, Signal, SignalDecision, TradePlan, TradeRecord, TradeFeatureSnapshot, TradeStatus, now_ts
 from .services.candle_store import CandleStore
 from .services.chart_service import normalize_timeframe
+from .services.entry_candle import entry_candle_fields, find_entry_candle
 from .services.chart_stream import ChartStreamer
 from .services.market import MarketProvider, OrderNotSent, build_provider, TIMEFRAMES
 from .services.market_init import MarketInitManager, MARKET_INIT_SERVICE_NAME
@@ -156,6 +157,11 @@ ORDER_PLACE_TIMEOUT_SECONDS = 65.0
 # finish inside ORDER_TIMEOUT_SECONDS. Both fetches together must leave room
 # for place_order.
 REVALIDATION_FETCH_TIMEOUT_SECONDS = 8.0
+# Entry-candle capture happens AFTER the order is placed, so it can only ever
+# lose metadata -- but it still must not hold up the trade_opened broadcast or
+# the settlement loop. Shorter than the revalidation budget on purpose: this is
+# a nice-to-have on the record, not a gate.
+ENTRY_CANDLE_FETCH_TIMEOUT_SECONDS = 5.0
 PROVIDER_CONNECT_TIMEOUT_SECONDS = 60.0      # ceiling for the initial/reconnect login call specifically --
                                               # deliberately more generous than PROVIDER_CALL_TIMEOUT_SECONDS
                                               # since a real login can legitimately involve OTP waits and
@@ -3039,6 +3045,59 @@ class Orchestrator:
             risk_cooldown_multiplier_high=float(getattr(t, "adaptive_risk_cooldown_multiplier_high", 1.5)),
         )
 
+    async def _attach_entry_candle(self, trade: TradeRecord, cached_candles) -> None:
+        """Record the OHLC of the bar this trade actually entered on.
+
+        Runs after the order is placed, so it can only ever lose metadata -- it
+        cannot change whether the trade executed, its size, or its price.
+        Nothing here feeds back into any decision.
+
+        Which candles it reads, and why not simply always refetch:
+        the caller hands over the candles the pre-trade revalidation already
+        fetched seconds earlier. Reusing them costs nothing, and the bar a
+        trade enters on is still forming, so a refetch would differ only by the
+        few ticks traded in between -- not worth a network round trip (which
+        get_candles may answer by re-seeding 120+ bars) on every execution. A
+        fresh fetch happens only when the entry bucket is missing entirely,
+        which is what a bar boundary crossed mid-execution looks like.
+
+        The bucket itself is resolved by entry_candle.find_entry_candle, which
+        refuses to return a neighbouring bar: if the exact candle is not there
+        the fields stay None rather than quietly quoting a different bar's OHLC.
+        """
+        try:
+            result = find_entry_candle(cached_candles, trade.created_at, trade.timeframe)
+            if not result.found:
+                try:
+                    fresh = await asyncio.wait_for(
+                        self._revalidation_candles(trade.asset, trade.timeframe),
+                        timeout=ENTRY_CANDLE_FETCH_TIMEOUT_SECONDS,
+                    )
+                except Exception as exc:
+                    fresh = None
+                    logger.debug("[entry_candle] refetch unavailable for %s/%s: %s",
+                                 trade.asset, trade.timeframe, type(exc).__name__)
+                result = find_entry_candle(fresh, trade.created_at, trade.timeframe)
+
+            for field, value in entry_candle_fields(result).items():
+                setattr(trade, field, value)
+
+            if result.found:
+                logger.debug(
+                    "[entry_candle] trade %s entered on the %s candle (bucket %d)",
+                    trade.id, trade.timeframe, result.bucket,
+                )
+            else:
+                # Logged, not raised: a missing bar is worth knowing about but
+                # must never surface as a failed trade.
+                logger.info(
+                    "[entry_candle] trade %s (%s %s) has no entry candle: %s",
+                    trade.id, trade.asset, trade.timeframe, result.reason,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[entry_candle] capture failed for trade %s: %s",
+                           trade.id, type(exc).__name__)
+
     def _build_feature_snapshot(
         self, sig: Signal, current_df, contributing: List[str], latency_breakdown: Optional[Dict[str, float]],
     ) -> Optional[TradeFeatureSnapshot]:
@@ -4394,6 +4453,11 @@ class Orchestrator:
         # real candles first and use the same "asset|tf" cache key convention
         # used everywhere else in this file.
         current_df = None
+        # Bound here as well as current_df: the entry-capture step below reads
+        # this after the try, and if the fetch raised it would otherwise be
+        # unbound. None means "no free candles to reuse", which the capture
+        # step already handles.
+        cur_candles = None
         htf_df = None
         try:
             # BUG FIX (2026-08): these two revalidation fetches used
@@ -4710,6 +4774,10 @@ class Orchestrator:
             strategies=contributing, timeframe=sig.timeframe, broker_order_id=str(oid),
             features=features, decision_id=sig.decision_id,
         )
+        # Attach the entry bar's OHLC before the trade is published, so
+        # trade_opened already carries it and the chart marker can draw the
+        # correct candle on the first frame rather than after a refresh.
+        await self._attach_entry_candle(trade, cur_candles)
         self.active_trades[str(oid)] = trade
 
         # Shadow-validation only: compute what PatternRiskEngine would have

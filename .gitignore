@@ -36,3 +36,6 @@ __pycache__/
 # Local Postgres cluster created by pgserver for local runs / previews.
 # Holds no committed data; each developer boots their own.
 backend/.pgdata/
+
+# Local preview config (the sandbox proxy needs 0.0.0.0 + allowedHosts).
+frontend/vite.config.preview.ts

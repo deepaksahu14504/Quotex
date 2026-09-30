@@ -960,3 +960,92 @@ async def test_store_still_wins_over_the_file_when_both_exist(tmp_path):
     bundle = manager.load_session()
     assert bundle is not None
     assert bundle.ssid == "store-ssid", "the store is authoritative"
+
+
+# ── the provider actually detects an interactive challenge ─────────────────
+#
+# _note_login_block shipped without a direct test. It is the only thing that
+# turns an HTTP 200 challenge page into something distinguishable from a wrong
+# password, so it is worth pinning down.
+
+def _provider():
+    from app.services.market import PyQuotexProvider
+
+    p = PyQuotexProvider.__new__(PyQuotexProvider)
+    p._email = "user@example.com"
+    p._last_login_block = None
+    return p
+
+
+def test_challenge_page_is_detected():
+    p = _provider()
+    resp = SimpleNamespace(text="<html><title>Just a moment...</title></html>")
+
+    assert p._note_login_block(resp) is True
+    assert p.get_login_block_reason() == "browser_required"
+
+
+def test_normal_login_page_is_not_a_challenge():
+    p = _provider()
+    p._last_login_block = "browser_required"   # stale value from a prior attempt
+    resp = SimpleNamespace(text='<html><form><input name="keep_code"></form></html>')
+
+    assert p._note_login_block(resp) is False
+    assert p.get_login_block_reason() is None, "a stale block reason must clear"
+
+
+def test_response_without_text_does_not_crash():
+    p = _provider()
+
+    class NoText:
+        pass
+
+    assert p._note_login_block(NoText()) is False
+    assert p.get_login_block_reason() is None
+
+
+def test_challenge_detection_reaches_the_manager_verdict():
+    """Full chain: provider flag -> orchestrator probe -> manager verdict."""
+    import app.orchestrator as orch
+
+    p = _provider()
+    p._note_login_block(SimpleNamespace(text="Verify you are human"))
+
+    stub = SimpleNamespace(state=SimpleNamespace(otp_required=False), provider=p)
+    assert orch.Orchestrator._probe_auth_status(stub) == "browser_required"
+
+    # and the manager classifies that as a challenge, not a blip
+    from app.broker_auth import QuotexAuthSessionManager as M
+    result = M("u1")._classify("browser_required", SessionBundle(ssid="s", cookies="c"))
+    assert result.browser_required is True
+    assert result.unknown is False
+
+
+def test_challenge_log_never_includes_the_response_body(monkeypatch):
+    """An interstitial can carry challenge tokens; a login page echoes the form.
+
+    Uses a patched module logger rather than a logging.Handler: a self-attached
+    handler captures nothing once another test in the session has reconfigured
+    logging, which makes the assertion vacuously true.
+    """
+    from app.services import market as market_mod
+
+    p = _provider()
+    secret_marker = "cf_chl_TOKEN_DO_NOT_LOG_12345"
+    records = []
+
+    class Spy:
+        def __getattr__(self, _level):
+            return lambda msg, *a, **k: records.append(msg % a if a else msg)
+
+    monkeypatch.setattr(market_mod, "logger", Spy())
+
+    p._note_login_block(SimpleNamespace(
+        text=f"<html>{secret_marker} Just a moment...</html>"))
+
+    assert records, "expected the challenge to be logged"
+    assert all(secret_marker not in m for m in records), \
+        f"response body leaked into the log: {records}"
+
+    # negative control: prove the spy is actually wired to this call path
+    assert any("interactive security challenge" in m for m in records), records

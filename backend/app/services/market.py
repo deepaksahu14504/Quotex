@@ -618,6 +618,9 @@ class PyQuotexProvider(MarketProvider):
         self._cookies = cookies
         self._user_agent = user_agent
         self._sessions_dir_override = sessions_dir
+        # Set when a login attempt was refused by an interactive challenge
+        # rather than by bad credentials. Never holds response content.
+        self._last_login_block: Optional[str] = None
         self._client = None
         self._orders: Dict[str, dict] = {}
         self._connected = False
@@ -737,6 +740,44 @@ class PyQuotexProvider(MarketProvider):
             )
         )
 
+    def _note_login_block(self, response: object) -> bool:
+        """Record whether a failed login was an interactive challenge.
+
+        Returns True when the response looks like Quotex (or Cloudflare in
+        front of it) is demanding a real browser instead of rejecting the
+        credentials. Detection only -- nothing here solves, bypasses or works
+        around the challenge.
+
+        The response body is deliberately NOT logged: an interstitial can carry
+        challenge tokens, and a login page echoes the submitted form.
+        """
+        self._last_login_block = None
+        text = getattr(response, "text", None)
+        if not text:
+            return False
+        try:
+            from ..broker_auth import QuotexAuthSessionManager
+            blocked = QuotexAuthSessionManager.requires_browser(text)
+        except Exception:
+            return False
+        if blocked:
+            self._last_login_block = "browser_required"
+            logger.warning(
+                "Quotex login was answered with an interactive security "
+                "challenge for %s; this needs a real browser session and will "
+                "not be worked around", self._email,
+            )
+        return blocked
+
+    def get_login_block_reason(self) -> Optional[str]:
+        """Why the last login attempt failed, when it was not the credentials.
+
+        Currently only "browser_required". The auth manager uses this to emit
+        AUTH_BROWSER_REQUIRED and stop instead of retrying logins that can
+        never succeed without a human.
+        """
+        return self._last_login_block
+
     async def _seed_session_via_curlcffi(self, sessions_dir: Path, lang: str) -> bool:
         try:
             from curl_cffi import requests
@@ -803,6 +844,7 @@ class PyQuotexProvider(MarketProvider):
             response, token, _ = await asyncio.to_thread(_warm_and_post, session)
             if response.status_code != 200:
                 logger.warning("curl_cffi warm login failed with HTTP %s", response.status_code)
+                self._note_login_block(response)
                 return False
 
             if 'name="keep_code"' in response.text:
@@ -860,6 +902,9 @@ class PyQuotexProvider(MarketProvider):
             cookies = session.cookies.get_dict()
             if not ssid or not cookies:
                 logger.warning("curl_cffi fallback could not extract a usable Quotex session.")
+                # A challenge page returns HTTP 200 with no session in it, which
+                # is otherwise indistinguishable from a wrong password.
+                self._note_login_block(response)
                 return False
 
             session_data = {

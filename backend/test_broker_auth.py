@@ -685,3 +685,92 @@ def test_orchestrator_probe_reports_otp_from_state_not_the_broker():
     bare = SimpleNamespace(state=SimpleNamespace(otp_required=False),
                            provider=SimpleNamespace())
     assert orch.Orchestrator._probe_auth_status(bare) == "unknown"
+
+
+# ── interactive challenge is reported, never worked around (items 8/11) ────
+#
+# Two dead paths were found here and both are now live:
+#
+#  1. `_classify` only tested challenge *page content* via requires_browser(),
+#     but the probe reports a short status token. No marker can match the
+#     literal "browser_required", so it fell through to `unknown` and was
+#     mistaken for a transient network blip.
+#  2. Nothing produced that token at all: market.py never inspected a failed
+#     login response, so an HTTP 200 challenge page was indistinguishable from
+#     a wrong password.
+#
+# Detection only. No test here asserts that a challenge is bypassed.
+
+@pytest.mark.asyncio
+async def test_interactive_challenge_stops_instead_of_retrying(tmp_path):
+    events = []
+    manager, store, calls = make_manager(
+        tmp_path, "u1", status="browser_required",
+        on_event=lambda e, **kw: events.append(e),
+    )
+    await manager.save_session("blocked-ssid", "cookie=1", "UA/1.0")
+
+    result = await manager.validate_session()
+
+    assert result.browser_required is True
+    assert result.valid is False
+    assert result.unknown is False, "a challenge is a definite verdict, not a blip"
+    assert result.expired is False, "a challenge is NOT session expiry"
+    assert AUTH_BROWSER_REQUIRED in events
+
+    assert await manager.reconnect_session() is False
+    assert calls["login"] == 0, "retrying cannot succeed; do not burn attempts"
+    assert AUTH_FRESH_SESSION_STARTED not in events
+
+
+@pytest.mark.asyncio
+async def test_interactive_challenge_preserves_the_session(tmp_path):
+    manager, store, calls = make_manager(tmp_path, "u1", status="browser_required")
+    await manager.save_session("blocked-ssid", "cookie=1", "UA/1.0")
+
+    assert await manager.reconnect_session() is False
+    assert store.rows["u1"]["ssid"] == "blocked-ssid", "session must survive"
+    assert manager.session_path.exists()
+    assert manager.can_trade is False
+
+
+def test_classify_recognises_the_literal_browser_required_token():
+    """The regression: a status token is not challenge page content."""
+    from app.broker_auth import QuotexAuthSessionManager as M
+
+    assert M.requires_browser("browser_required") is False, \
+        "no marker matches the token -- this is why the literal is needed"
+    bundle = SessionBundle(ssid="s", cookies="c")
+    result = M("u1")._classify("browser_required", bundle)
+    assert result.browser_required is True
+    assert result.unknown is False
+
+    # page-content detection must keep working too
+    assert M("u1")._classify("Just a moment...", bundle).browser_required is True
+    assert M("u1")._classify("websocket disconnected", bundle).unknown is True
+
+
+def test_provider_block_reason_reaches_the_probe():
+    """The REAL orchestrator probe, with a negative control."""
+    import app.orchestrator as orch
+
+    def probe(block_reason, auth_status="failed", otp=False):
+        stub = SimpleNamespace(
+            state=SimpleNamespace(otp_required=otp),
+            provider=SimpleNamespace(
+                get_auth_status=lambda: auth_status,
+                get_login_block_reason=lambda: block_reason,
+            ),
+        )
+        return orch.Orchestrator._probe_auth_status(stub)
+
+    assert probe("browser_required") == "browser_required"
+    assert probe(None) == "failed"
+    # a pending PIN still outranks a stale block reason
+    assert probe("browser_required", auth_status="failed", otp=True) == "otp_required"
+
+    # negative control: without the block hook a challenge reads as a plain
+    # auth failure and the manager would keep retrying logins
+    stub = SimpleNamespace(state=SimpleNamespace(otp_required=False),
+                           provider=SimpleNamespace(get_auth_status=lambda: "failed"))
+    assert orch.Orchestrator._probe_auth_status(stub) == "failed"

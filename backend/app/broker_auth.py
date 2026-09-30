@@ -432,7 +432,13 @@ class QuotexAuthSessionManager:
         if v in self._EXPIRED_VERDICTS:
             return ValidationResult(expired=True, rejected=True, bundle=bundle,
                                     reason=f"broker rejected the session ({v})")
-        if self.requires_browser(v):
+        # "browser_required" is the explicit verdict the caller emits when a
+        # login was answered with an interactive challenge. It is matched here
+        # as a literal, because none of BROWSER_REQUIRED_MARKERS (which test
+        # challenge *page content*) can match a short status token -- without
+        # this the verdict would fall through to `unknown` and be mistaken for
+        # a transient network blip.
+        if v == "browser_required" or self.requires_browser(v):
             return ValidationResult(browser_required=True, bundle=bundle,
                                     reason="broker requires an interactive "
                                            "browser security check")

@@ -680,6 +680,16 @@ class Orchestrator:
         """
         if self.state.otp_required:
             return "otp_required"
+        # A login answered with an interactive challenge is not a credential
+        # failure, and retrying it can never succeed. Surface it so the manager
+        # emits AUTH_BROWSER_REQUIRED and stops instead of burning attempts.
+        block = getattr(self.provider, "get_login_block_reason", None)
+        if block is not None:
+            try:
+                if block() == "browser_required":
+                    return "browser_required"
+            except Exception:
+                pass
         probe = getattr(self.provider, "get_auth_status", None)
         if probe is None:
             return "unknown"
